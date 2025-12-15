@@ -174,11 +174,20 @@ export async function parseRepositories(repositories, repositoriesFile, owner, o
  * @param {string} repo - Repository in "owner/repo" format
  * @param {Object} settings - Settings to update
  * @param {boolean} enableCodeScanning - Enable default CodeQL scanning
+ * @param {boolean|null} immutableReleases - Enable or disable immutable releases
  * @param {Array<string>|null} topics - Topics to set on repository
  * @param {boolean} dryRun - Preview mode without making actual changes
  * @returns {Promise<Object>} Result object
  */
-export async function updateRepositorySettings(octokit, repo, settings, enableCodeScanning, topics, dryRun) {
+export async function updateRepositorySettings(
+  octokit,
+  repo,
+  settings,
+  enableCodeScanning,
+  immutableReleases,
+  topics,
+  dryRun
+) {
   const [owner, repoName] = repo.split('/');
 
   if (!owner || !repoName) {
@@ -438,6 +447,71 @@ export async function updateRepositorySettings(octokit, repo, settings, enableCo
       }
     }
 
+    // Handle immutable releases
+    if (immutableReleases !== null) {
+      try {
+        // Check current immutable releases status
+        let currentImmutableReleases = false;
+        try {
+          const response = await octokit.request('GET /repos/{owner}/{repo}/immutable-releases', {
+            owner,
+            repo: repoName,
+            headers: {
+              'X-GitHub-Api-Version': '2022-11-28'
+            }
+          });
+          // Check the 'enabled' property in the response
+          currentImmutableReleases = response.data.enabled === true;
+        } catch (error) {
+          // 404 means immutable releases are not enabled
+          if (error.status === 404) {
+            currentImmutableReleases = false;
+          } else {
+            throw error;
+          }
+        }
+
+        result.currentImmutableReleases = currentImmutableReleases;
+
+        if (currentImmutableReleases !== immutableReleases) {
+          result.immutableReleasesChange = {
+            from: currentImmutableReleases,
+            to: immutableReleases
+          };
+
+          if (!dryRun) {
+            if (immutableReleases) {
+              // Enable immutable releases
+              await octokit.request('PUT /repos/{owner}/{repo}/immutable-releases', {
+                owner,
+                repo: repoName,
+                headers: {
+                  'X-GitHub-Api-Version': '2022-11-28'
+                }
+              });
+            } else {
+              // Disable immutable releases
+              await octokit.request('DELETE /repos/{owner}/{repo}/immutable-releases', {
+                owner,
+                repo: repoName,
+                headers: {
+                  'X-GitHub-Api-Version': '2022-11-28'
+                }
+              });
+            }
+            result.immutableReleasesUpdated = true;
+          } else {
+            result.immutableReleasesWouldUpdate = true;
+          }
+        } else {
+          result.immutableReleasesUnchanged = true;
+        }
+      } catch (error) {
+        // Immutable releases might fail for various reasons (insufficient permissions, not available, etc.)
+        result.immutableReleasesWarning = `Could not process immutable releases: ${error.message}`;
+      }
+    }
+
     return result;
   } catch (error) {
     return {
@@ -450,17 +524,26 @@ export async function updateRepositorySettings(octokit, repo, settings, enableCo
 }
 
 /**
- * Sync dependabot.yml file to target repository
+ * Generic function to sync a file to a target repository via pull request
  * @param {Octokit} octokit - Octokit instance
  * @param {string} repo - Repository in "owner/repo" format
- * @param {string} dependabotYmlPath - Path to local dependabot.yml file
- * @param {string} prTitle - Title for the pull request
+ * @param {Object} options - Sync options
+ * @param {string} options.sourceFilePath - Path to local source file
+ * @param {string} options.targetPath - Target path in the repository
+ * @param {string} options.branchName - Branch name for the PR
+ * @param {string} options.prTitle - Title for the pull request
+ * @param {string} options.prBodyCreate - PR body when creating new file
+ * @param {string} options.prBodyUpdate - PR body when updating existing file
+ * @param {string} options.resultKey - Key for the result status (e.g., 'dependabotYml', 'pullRequestTemplate')
+ * @param {string} options.fileDescription - Human-readable description of the file (for error messages)
  * @param {boolean} dryRun - Preview mode without making actual changes
  * @returns {Promise<Object>} Result object
  */
-export async function syncDependabotYml(octokit, repo, dependabotYmlPath, prTitle, dryRun) {
+export async function syncFileViaPullRequest(octokit, repo, options, dryRun) {
+  const { sourceFilePath, targetPath, branchName, prTitle, prBodyCreate, prBodyUpdate, resultKey, fileDescription } =
+    options;
+
   const [owner, repoName] = repo.split('/');
-  const targetPath = '.github/dependabot.yml';
 
   if (!owner || !repoName) {
     return {
@@ -472,15 +555,15 @@ export async function syncDependabotYml(octokit, repo, dependabotYmlPath, prTitl
   }
 
   try {
-    // Read the source dependabot.yml file
+    // Read the source file
     let sourceContent;
     try {
-      sourceContent = fs.readFileSync(dependabotYmlPath, 'utf8');
+      sourceContent = fs.readFileSync(sourceFilePath, 'utf8');
     } catch (error) {
       return {
         repository: repo,
         success: false,
-        error: `Failed to read dependabot.yml file at ${dependabotYmlPath}: ${error.message}`,
+        error: `Failed to read ${fileDescription} file at ${sourceFilePath}: ${error.message}`,
         dryRun
       };
     }
@@ -492,7 +575,7 @@ export async function syncDependabotYml(octokit, repo, dependabotYmlPath, prTitl
     });
     const defaultBranch = repoData.default_branch;
 
-    // Check if dependabot.yml exists in the target repo
+    // Check if file exists in the target repo
     let existingSha = null;
     let existingContent = null;
 
@@ -521,14 +604,13 @@ export async function syncDependabotYml(octokit, repo, dependabotYmlPath, prTitl
       return {
         repository: repo,
         success: true,
-        dependabotYml: 'unchanged',
+        [resultKey]: 'unchanged',
         message: `${targetPath} is already up to date`,
         dryRun
       };
     }
 
     // Check if there's already an open PR for this update
-    const branchName = 'dependabot-yml-sync';
     let existingPR = null;
 
     try {
@@ -553,7 +635,7 @@ export async function syncDependabotYml(octokit, repo, dependabotYmlPath, prTitl
       return {
         repository: repo,
         success: true,
-        dependabotYml: 'pr-exists',
+        [resultKey]: 'pr-exists',
         message: `Open PR #${existingPR.number} already exists for ${targetPath}`,
         prNumber: existingPR.number,
         prUrl: existingPR.html_url,
@@ -565,7 +647,7 @@ export async function syncDependabotYml(octokit, repo, dependabotYmlPath, prTitl
       return {
         repository: repo,
         success: true,
-        dependabotYml: existingContent ? 'would-update' : 'would-create',
+        [resultKey]: existingContent ? 'would-update' : 'would-create',
         message: existingContent ? `Would update ${targetPath} via PR` : `Would create ${targetPath} via PR`,
         dryRun
       };
@@ -634,41 +716,24 @@ export async function syncDependabotYml(octokit, repo, dependabotYmlPath, prTitl
     core.info(`  ✍️  Committed changes to ${targetPath}`);
 
     // Prepare PR body content
-    const prBody = existingContent
-      ? `This PR updates \`.github/dependabot.yml\` to the latest version.\n\n**Changes:**\n- Updated dependabot configuration`
-      : `This PR adds \`.github/dependabot.yml\` to enable Dependabot.\n\n**Changes:**\n- Added dependabot configuration`;
+    const prBody = existingContent ? prBodyUpdate : prBodyCreate;
 
-    // Create or update PR
-    let prNumber;
-    if (existingPR) {
-      // Update existing PR
-      await octokit.rest.pulls.update({
-        owner,
-        repo: repoName,
-        pull_number: existingPR.number,
-        title: prTitle,
-        body: prBody
-      });
-      prNumber = existingPR.number;
-      core.info(`  🔄 Updated existing PR #${prNumber}`);
-    } else {
-      // Create new PR
-      const { data: pr } = await octokit.rest.pulls.create({
-        owner,
-        repo: repoName,
-        title: prTitle,
-        head: branchName,
-        base: defaultBranch,
-        body: prBody
-      });
-      prNumber = pr.number;
-      core.info(`  📬 Created PR #${prNumber}: ${pr.html_url}`);
-    }
+    // Create new PR (we only reach here if no existing PR was found)
+    const { data: pr } = await octokit.rest.pulls.create({
+      owner,
+      repo: repoName,
+      title: prTitle,
+      head: branchName,
+      base: defaultBranch,
+      body: prBody
+    });
+    const prNumber = pr.number;
+    core.info(`  📬 Created PR #${prNumber}: ${pr.html_url}`);
 
     return {
       repository: repo,
       success: true,
-      dependabotYml: existingContent ? 'updated' : 'created',
+      [resultKey]: existingContent ? 'updated' : 'created',
       prNumber,
       prUrl: `https://github.com/${owner}/${repoName}/pull/${prNumber}`,
       message: existingContent
@@ -680,10 +745,37 @@ export async function syncDependabotYml(octokit, repo, dependabotYmlPath, prTitl
     return {
       repository: repo,
       success: false,
-      error: `Failed to sync dependabot.yml: ${error.message}`,
+      error: `Failed to sync ${fileDescription}: ${error.message}`,
       dryRun
     };
   }
+}
+
+/**
+ * Sync dependabot.yml file to target repository
+ * @param {Octokit} octokit - Octokit instance
+ * @param {string} repo - Repository in "owner/repo" format
+ * @param {string} dependabotYmlPath - Path to local dependabot.yml file
+ * @param {string} prTitle - Title for the pull request
+ * @param {boolean} dryRun - Preview mode without making actual changes
+ * @returns {Promise<Object>} Result object
+ */
+export async function syncDependabotYml(octokit, repo, dependabotYmlPath, prTitle, dryRun) {
+  return syncFileViaPullRequest(
+    octokit,
+    repo,
+    {
+      sourceFilePath: dependabotYmlPath,
+      targetPath: '.github/dependabot.yml',
+      branchName: 'dependabot-yml-sync',
+      prTitle,
+      prBodyCreate: `This PR adds \`.github/dependabot.yml\` to enable Dependabot.\n\n**Changes:**\n- Added dependabot configuration`,
+      prBodyUpdate: `This PR updates \`.github/dependabot.yml\` to the latest version.\n\n**Changes:**\n- Updated dependabot configuration`,
+      resultKey: 'dependabotYml',
+      fileDescription: 'dependabot.yml'
+    },
+    dryRun
+  );
 }
 
 /**
@@ -856,15 +948,43 @@ export async function syncRepositoryRuleset(octokit, repo, rulesetFilePath, dryR
 }
 
 /**
+ * Sync pull request template file to target repository
+ * @param {Octokit} octokit - Octokit instance
+ * @param {string} repo - Repository in "owner/repo" format
+ * @param {string} templatePath - Path to local pull request template file
+ * @param {string} prTitle - Title for the pull request
+ * @param {boolean} dryRun - Preview mode without making actual changes
+ * @returns {Promise<Object>} Result object
+ */
+export async function syncPullRequestTemplate(octokit, repo, templatePath, prTitle, dryRun) {
+  return syncFileViaPullRequest(
+    octokit,
+    repo,
+    {
+      sourceFilePath: templatePath,
+      targetPath: '.github/pull_request_template.md',
+      branchName: 'pull-request-template-sync',
+      prTitle,
+      prBodyCreate: `This PR adds \`.github/pull_request_template.md\` to standardize pull requests.\n\n**Changes:**\n- Added pull request template`,
+      prBodyUpdate: `This PR updates \`.github/pull_request_template.md\` to the latest version.\n\n**Changes:**\n- Updated pull request template`,
+      resultKey: 'pullRequestTemplate',
+      fileDescription: 'pull request template'
+    },
+    dryRun
+  );
+}
+
+/**
  * Check if a repository result has any changes
  * @param {Object} result - Repository update result object
- * @returns {boolean} True if there are any changes (settings, topics, code scanning, or dependabot)
+ * @returns {boolean} True if there are any changes (settings, topics, code scanning, immutable releases, dependabot, rulesets, or pull request template)
  */
 function hasRepositoryChanges(result) {
   return (
     (result.changes && result.changes.length > 0) ||
     result.topicsChange ||
     result.codeScanningChange ||
+    result.immutableReleasesChange ||
     (result.dependabotSync &&
       result.dependabotSync.success &&
       result.dependabotSync.dependabotYml &&
@@ -872,7 +992,11 @@ function hasRepositoryChanges(result) {
     (result.rulesetSync &&
       result.rulesetSync.success &&
       result.rulesetSync.ruleset &&
-      result.rulesetSync.ruleset !== 'unchanged')
+      result.rulesetSync.ruleset !== 'unchanged') ||
+    (result.pullRequestTemplateSync &&
+      result.pullRequestTemplateSync.success &&
+      result.pullRequestTemplateSync.pullRequestTemplate &&
+      result.pullRequestTemplateSync.pullRequestTemplate !== 'unchanged')
   );
 }
 
@@ -899,6 +1023,7 @@ export async function run() {
     };
 
     const enableCodeScanning = getBooleanInput('enable-default-code-scanning');
+    const immutableReleases = getBooleanInput('immutable-releases');
     const dryRun = getBooleanInput('dry-run');
 
     // Parse topics if provided
@@ -917,6 +1042,11 @@ export async function run() {
     // Get rulesets settings
     const rulesetsFile = getInput('rulesets-file');
 
+    // Get pull request template settings
+    const pullRequestTemplate = getInput('pull-request-template');
+    const pullRequestTemplatePrTitle =
+      getInput('pull-request-template-pr-title') || 'chore: update pull request template';
+
     core.info('Starting Bulk GitHub Repository Settings Action...');
 
     if (dryRun) {
@@ -931,12 +1061,14 @@ export async function run() {
     const hasSettings =
       Object.values(settings).some(value => value !== null) ||
       enableCodeScanning ||
+      immutableReleases !== null ||
       topics !== null ||
       dependabotYml ||
-      rulesetsFile;
+      rulesetsFile ||
+      pullRequestTemplate;
     if (!hasSettings) {
       throw new Error(
-        'At least one repository setting must be specified (or enable-default-code-scanning must be true, or topics must be provided, or dependabot-yml must be specified, or rulesets-file must be specified)'
+        'At least one repository setting must be specified (or enable-default-code-scanning must be true, or immutable-releases must be specified, or topics must be provided, or dependabot-yml must be specified, or rulesets-file must be specified, or pull-request-template must be specified)'
       );
     }
 
@@ -954,6 +1086,9 @@ export async function run() {
     if (enableCodeScanning) {
       core.info('CodeQL scanning will be enabled');
     }
+    if (immutableReleases !== null) {
+      core.info(`Immutable releases will be ${immutableReleases ? 'enabled' : 'disabled'}`);
+    }
     if (topics !== null) {
       core.info(`Topics to set: ${topics.join(', ')}`);
     }
@@ -962,6 +1097,9 @@ export async function run() {
     }
     if (rulesetsFile) {
       core.info(`Repository ruleset will be synced from: ${rulesetsFile}`);
+    }
+    if (pullRequestTemplate) {
+      core.info(`Pull request template will be synced from: ${pullRequestTemplate}`);
     }
 
     // Update repositories
@@ -1004,6 +1142,10 @@ export async function run() {
           ? repoConfig['enable-default-code-scanning']
           : enableCodeScanning;
 
+      // Handle repo-specific immutable releases
+      const repoImmutableReleases =
+        repoConfig['immutable-releases'] !== undefined ? repoConfig['immutable-releases'] : immutableReleases;
+
       // Handle repo-specific topics
       let repoTopics = topics;
       if (repoConfig.topics !== undefined) {
@@ -1031,11 +1173,18 @@ export async function run() {
         repoRulesetsFile = repoConfig['rulesets-file'];
       }
 
+      // Handle repo-specific pull-request-template
+      let repoPullRequestTemplate = pullRequestTemplate;
+      if (repoConfig['pull-request-template'] !== undefined) {
+        repoPullRequestTemplate = repoConfig['pull-request-template'];
+      }
+
       const result = await updateRepositorySettings(
         octokit,
         repo,
         repoSettings,
         repoEnableCodeScanning,
+        repoImmutableReleases,
         repoTopics,
         dryRun
       );
@@ -1050,15 +1199,9 @@ export async function run() {
         result.dependabotSync = dependabotResult;
 
         if (dependabotResult.success) {
-          if (dependabotResult.dependabotYml === 'unchanged') {
-            core.info(`  📦 ${dependabotResult.message}`);
-          } else if (dryRun) {
-            core.info(`  📦 ${dependabotResult.message}`);
-          } else {
-            core.info(`  📦 ${dependabotResult.message}`);
-            if (dependabotResult.prUrl) {
-              core.info(`  🔗 PR URL: ${dependabotResult.prUrl}`);
-            }
+          core.info(`  📦 ${dependabotResult.message}`);
+          if (dependabotResult.prUrl) {
+            core.info(`  🔗 PR URL: ${dependabotResult.prUrl}`);
           }
         } else {
           core.warning(`  ⚠️  ${dependabotResult.error}`);
@@ -1077,6 +1220,30 @@ export async function run() {
           core.info(`  📋 ${rulesetResult.message}`);
         } else {
           core.warning(`  ⚠️  ${rulesetResult.error}`);
+        }
+      }
+
+      // Sync pull request template if specified
+      if (repoPullRequestTemplate) {
+        core.info(`  📝 Checking pull request template...`);
+        const templateResult = await syncPullRequestTemplate(
+          octokit,
+          repo,
+          repoPullRequestTemplate,
+          pullRequestTemplatePrTitle,
+          dryRun
+        );
+
+        // Add pull request template result to the main result
+        result.pullRequestTemplateSync = templateResult;
+
+        if (templateResult.success) {
+          core.info(`  📝 ${templateResult.message}`);
+          if (templateResult.prUrl) {
+            core.info(`  🔗 PR URL: ${templateResult.prUrl}`);
+          }
+        } else {
+          core.warning(`  ⚠️  ${templateResult.error}`);
         }
       }
 
@@ -1142,8 +1309,27 @@ export async function run() {
           core.warning(`  ⚠️ ${result.codeScanningWarning}`);
         }
 
+        // Log immutable releases changes
+        if (result.immutableReleasesChange) {
+          if (dryRun) {
+            core.info(
+              `  🔒 Would ${result.immutableReleasesChange.to ? 'enable' : 'disable'} immutable releases: ${result.immutableReleasesChange.from} → ${result.immutableReleasesChange.to}`
+            );
+          } else {
+            core.info(
+              `  🔒 Immutable releases ${result.immutableReleasesChange.to ? 'enabled' : 'disabled'}: ${result.immutableReleasesChange.from} → ${result.immutableReleasesChange.to}`
+            );
+          }
+        } else if (result.immutableReleasesUnchanged) {
+          core.info(`  🔒 Immutable releases unchanged: ${result.currentImmutableReleases ? 'enabled' : 'disabled'}`);
+        }
+
+        if (result.immutableReleasesWarning) {
+          core.warning(`  ⚠️ ${result.immutableReleasesWarning}`);
+        }
+
         // Log if no changes were needed
-        if ((!result.changes || result.changes.length === 0) && !result.topicsChange && !result.codeScanningChange) {
+        if (!hasRepositoryChanges(result)) {
           core.info(`  ℹ️  No changes needed - all settings already match desired state`);
         }
       } else {
