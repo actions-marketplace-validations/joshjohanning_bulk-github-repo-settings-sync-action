@@ -59,6 +59,10 @@ inputs:
   rulesets-file:
     description: 'Path to a JSON file containing repository ruleset configuration to sync to target repositories'
     required: false
+  delete-unmanaged-rulesets:
+    description: 'Delete all other rulesets besides the one being synced'
+    required: false
+    default: 'false'
   pull-request-template:
     description: 'Path to a pull request template file to sync to .github/pull_request_template.md in target repositories'
     required: false
@@ -73,6 +77,9 @@ inputs:
     description: 'Title for pull requests when updating workflow files'
     required: false
     default: 'chore: sync workflow configuration'
+  autolinks-file:
+    description: 'Path to a JSON file containing autolink references to sync to target repositories'
+    required: false
   dry-run:
     description: 'Preview changes without applying them (logs what would be changed)'
     required: false

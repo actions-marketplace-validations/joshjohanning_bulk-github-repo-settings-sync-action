@@ -43,7 +43,11 @@ const mockOctokit = {
       getRepoRulesets: jest.fn(),
       getRepoRuleset: jest.fn(),
       createRepoRuleset: jest.fn(),
-      updateRepoRuleset: jest.fn()
+      updateRepoRuleset: jest.fn(),
+      deleteRepoRuleset: jest.fn(),
+      listAutolinks: jest.fn(),
+      createAutolink: jest.fn(),
+      deleteAutolink: jest.fn()
     },
     codeScanning: {
       updateDefaultSetup: jest.fn(),
@@ -93,7 +97,8 @@ const {
   syncDependabotYml,
   syncRepositoryRuleset,
   syncPullRequestTemplate,
-  syncWorkflowFiles
+  syncWorkflowFiles,
+  syncAutolinks
 } = await import('../src/index.js');
 
 describe('Bulk GitHub Repository Settings Action', () => {
@@ -111,6 +116,9 @@ describe('Bulk GitHub Repository Settings Action', () => {
     mockOctokit.rest.repos.getRepoRuleset.mockClear();
     mockOctokit.rest.repos.createRepoRuleset.mockClear();
     mockOctokit.rest.repos.updateRepoRuleset.mockClear();
+    mockOctokit.rest.repos.listAutolinks.mockClear();
+    mockOctokit.rest.repos.createAutolink.mockClear();
+    mockOctokit.rest.repos.deleteAutolink.mockClear();
     mockOctokit.rest.codeScanning.updateDefaultSetup.mockClear();
     mockOctokit.rest.orgs.get.mockClear();
     mockOctokit.rest.git.getRef.mockClear();
@@ -817,7 +825,7 @@ describe('Bulk GitHub Repository Settings Action', () => {
       await run();
 
       expect(mockCore.setFailed).toHaveBeenCalledWith(
-        'Action failed with error: At least one repository setting must be specified (or enable-default-code-scanning must be true, or immutable-releases must be specified, or topics must be provided, or dependabot-yml must be specified, or rulesets-file must be specified, or pull-request-template must be specified, or workflow-files must be specified)'
+        'Action failed with error: At least one repository setting must be specified (or enable-default-code-scanning must be true, or immutable-releases must be specified, or topics must be provided, or dependabot-yml must be specified, or rulesets-file must be specified, or pull-request-template must be specified, or workflow-files must be specified, or autolinks-file must be specified)'
       );
     });
 
@@ -1425,7 +1433,7 @@ describe('Bulk GitHub Repository Settings Action', () => {
         data: { id: 456, name: 'ci' }
       });
 
-      const result = await syncRepositoryRuleset(mockOctokit, 'owner/repo', './ruleset.json', false);
+      const result = await syncRepositoryRuleset(mockOctokit, 'owner/repo', './ruleset.json', false, false);
 
       expect(result.success).toBe(true);
       expect(result.ruleset).toBe('updated');
@@ -1472,7 +1480,7 @@ describe('Bulk GitHub Repository Settings Action', () => {
         data: existingRuleset
       });
 
-      const result = await syncRepositoryRuleset(mockOctokit, 'owner/repo', './ruleset.json', false);
+      const result = await syncRepositoryRuleset(mockOctokit, 'owner/repo', './ruleset.json', false, false);
 
       expect(result.success).toBe(true);
       expect(result.ruleset).toBe('unchanged');
@@ -1559,7 +1567,7 @@ describe('Bulk GitHub Repository Settings Action', () => {
       mockFs.readFileSync.mockReturnValue(JSON.stringify(rulesetConfig));
       mockOctokit.rest.repos.getRepoRulesets.mockResolvedValue({ data: [] });
 
-      const result = await syncRepositoryRuleset(mockOctokit, 'owner/repo', './ruleset.json', true);
+      const result = await syncRepositoryRuleset(mockOctokit, 'owner/repo', './ruleset.json', false, true);
 
       expect(result.success).toBe(true);
       expect(result.ruleset).toBe('would-create');
@@ -1591,7 +1599,7 @@ describe('Bulk GitHub Repository Settings Action', () => {
         data: existingRuleset
       });
 
-      const result = await syncRepositoryRuleset(mockOctokit, 'owner/repo', './ruleset.json', true);
+      const result = await syncRepositoryRuleset(mockOctokit, 'owner/repo', './ruleset.json', false, true);
 
       expect(result.success).toBe(true);
       expect(result.ruleset).toBe('would-update');
@@ -1602,7 +1610,7 @@ describe('Bulk GitHub Repository Settings Action', () => {
     });
 
     test('should handle invalid repository format', async () => {
-      const result = await syncRepositoryRuleset(mockOctokit, 'invalid-repo-format', './ruleset.json', false);
+      const result = await syncRepositoryRuleset(mockOctokit, 'invalid-repo-format', './ruleset.json', false, false);
 
       expect(result.success).toBe(false);
       expect(result.error).toContain('Invalid repository format');
@@ -1613,7 +1621,7 @@ describe('Bulk GitHub Repository Settings Action', () => {
         throw new Error('ENOENT: no such file or directory');
       });
 
-      const result = await syncRepositoryRuleset(mockOctokit, 'owner/repo', './nonexistent.json', false);
+      const result = await syncRepositoryRuleset(mockOctokit, 'owner/repo', './nonexistent.json', false, false);
 
       expect(result.success).toBe(false);
       expect(result.error).toContain('Failed to read or parse ruleset file');
@@ -1622,7 +1630,7 @@ describe('Bulk GitHub Repository Settings Action', () => {
     test('should handle invalid JSON in ruleset file', async () => {
       mockFs.readFileSync.mockReturnValue('{ invalid json }');
 
-      const result = await syncRepositoryRuleset(mockOctokit, 'owner/repo', './invalid.json', false);
+      const result = await syncRepositoryRuleset(mockOctokit, 'owner/repo', './invalid.json', false, false);
 
       expect(result.success).toBe(false);
       expect(result.error).toContain('Failed to read or parse ruleset file');
@@ -1637,7 +1645,7 @@ describe('Bulk GitHub Repository Settings Action', () => {
 
       mockFs.readFileSync.mockReturnValue(JSON.stringify(rulesetConfig));
 
-      const result = await syncRepositoryRuleset(mockOctokit, 'owner/repo', './ruleset.json', false);
+      const result = await syncRepositoryRuleset(mockOctokit, 'owner/repo', './ruleset.json', false, false);
 
       expect(result.success).toBe(false);
       expect(result.error).toContain('Ruleset configuration must include a "name" field');
@@ -1654,7 +1662,7 @@ describe('Bulk GitHub Repository Settings Action', () => {
       mockFs.readFileSync.mockReturnValue(JSON.stringify(rulesetConfig));
       mockOctokit.rest.repos.getRepoRulesets.mockRejectedValue(new Error('API rate limit exceeded'));
 
-      const result = await syncRepositoryRuleset(mockOctokit, 'owner/repo', './ruleset.json', false);
+      const result = await syncRepositoryRuleset(mockOctokit, 'owner/repo', './ruleset.json', false, false);
 
       expect(result.success).toBe(false);
       expect(result.error).toContain('Failed to sync ruleset');
@@ -1676,10 +1684,318 @@ describe('Bulk GitHub Repository Settings Action', () => {
         data: { id: 123, name: 'ci' }
       });
 
-      const result = await syncRepositoryRuleset(mockOctokit, 'owner/repo', './ruleset.json', false);
+      const result = await syncRepositoryRuleset(mockOctokit, 'owner/repo', './ruleset.json', false, false);
 
       expect(result.success).toBe(true);
       expect(result.ruleset).toBe('created');
+    });
+
+    test('should delete unmanaged rulesets when updating a ruleset', async () => {
+      const rulesetConfig = {
+        name: 'ci',
+        target: 'branch',
+        enforcement: 'active',
+        rules: [{ type: 'deletion' }, { type: 'pull_request' }] // Different from existing
+      };
+
+      const existingRulesets = [
+        { id: 123, name: 'ci' },
+        { id: 456, name: 'old-ruleset' }
+      ];
+
+      mockFs.readFileSync.mockReturnValue(JSON.stringify(rulesetConfig));
+      mockOctokit.rest.repos.getRepoRulesets.mockResolvedValue({
+        data: existingRulesets
+      });
+      mockOctokit.rest.repos.getRepoRuleset.mockResolvedValue({
+        data: {
+          id: 123,
+          name: 'ci',
+          target: 'branch',
+          enforcement: 'active',
+          rules: [{ type: 'deletion' }] // Different - triggers update
+        }
+      });
+      mockOctokit.rest.repos.updateRepoRuleset.mockResolvedValue({});
+      mockOctokit.rest.repos.deleteRepoRuleset.mockResolvedValue({});
+
+      const result = await syncRepositoryRuleset(mockOctokit, 'owner/repo', './ruleset.json', true, false);
+
+      expect(result.success).toBe(true);
+      expect(result.ruleset).toBe('updated');
+      expect(result.deletedRulesets).toHaveLength(1);
+      expect(result.deletedRulesets[0].name).toBe('old-ruleset');
+      expect(result.deletedRulesets[0].deleted).toBe(true);
+      expect(mockOctokit.rest.repos.updateRepoRuleset).toHaveBeenCalledTimes(1);
+      expect(mockOctokit.rest.repos.deleteRepoRuleset).toHaveBeenCalledWith({
+        owner: 'owner',
+        repo: 'repo',
+        ruleset_id: 456
+      });
+    });
+
+    test('should delete unmanaged rulesets when creating a new ruleset', async () => {
+      const rulesetConfig = {
+        name: 'new-ruleset',
+        target: 'branch',
+        enforcement: 'active',
+        rules: [{ type: 'deletion' }]
+      };
+
+      const existingRulesets = [
+        { id: 456, name: 'old-ruleset' },
+        { id: 789, name: 'another-old-ruleset' }
+      ];
+
+      mockFs.readFileSync.mockReturnValue(JSON.stringify(rulesetConfig));
+      mockOctokit.rest.repos.getRepoRulesets.mockResolvedValue({
+        data: existingRulesets
+      });
+      mockOctokit.rest.repos.createRepoRuleset.mockResolvedValue({
+        data: { id: 999, name: 'new-ruleset' }
+      });
+      mockOctokit.rest.repos.deleteRepoRuleset.mockResolvedValue({});
+
+      const result = await syncRepositoryRuleset(mockOctokit, 'owner/repo', './ruleset.json', true, false);
+
+      expect(result.success).toBe(true);
+      expect(result.ruleset).toBe('created');
+      expect(result.rulesetId).toBe(999);
+      expect(result.deletedRulesets).toHaveLength(2);
+      expect(result.deletedRulesets[0].name).toBe('old-ruleset');
+      expect(result.deletedRulesets[0].deleted).toBe(true);
+      expect(result.deletedRulesets[1].name).toBe('another-old-ruleset');
+      expect(result.deletedRulesets[1].deleted).toBe(true);
+      expect(mockOctokit.rest.repos.createRepoRuleset).toHaveBeenCalledTimes(1);
+      expect(mockOctokit.rest.repos.deleteRepoRuleset).toHaveBeenCalledTimes(2);
+    });
+
+    test('should delete unmanaged rulesets when delete-unmanaged-rulesets is enabled', async () => {
+      const rulesetConfig = {
+        name: 'ci',
+        target: 'branch',
+        enforcement: 'active',
+        rules: [{ type: 'deletion' }]
+      };
+
+      const existingRulesets = [
+        { id: 123, name: 'ci' },
+        { id: 456, name: 'ci2' },
+        { id: 789, name: 'old-ruleset' }
+      ];
+
+      mockFs.readFileSync.mockReturnValue(JSON.stringify(rulesetConfig));
+      mockOctokit.rest.repos.getRepoRulesets.mockResolvedValue({
+        data: existingRulesets
+      });
+      mockOctokit.rest.repos.getRepoRuleset.mockResolvedValue({
+        data: {
+          id: 123,
+          name: 'ci',
+          target: 'branch',
+          enforcement: 'active',
+          rules: [{ type: 'deletion' }]
+        }
+      });
+      mockOctokit.rest.repos.deleteRepoRuleset.mockResolvedValue({});
+
+      const result = await syncRepositoryRuleset(mockOctokit, 'owner/repo', './ruleset.json', true, false);
+
+      expect(result.success).toBe(true);
+      expect(result.ruleset).toBe('unchanged');
+      expect(result.deletedRulesets).toHaveLength(2);
+      expect(result.deletedRulesets[0].name).toBe('ci2');
+      expect(result.deletedRulesets[0].deleted).toBe(true);
+      expect(result.deletedRulesets[1].name).toBe('old-ruleset');
+      expect(result.deletedRulesets[1].deleted).toBe(true);
+      expect(mockOctokit.rest.repos.deleteRepoRuleset).toHaveBeenCalledTimes(2);
+      expect(mockOctokit.rest.repos.deleteRepoRuleset).toHaveBeenCalledWith({
+        owner: 'owner',
+        repo: 'repo',
+        ruleset_id: 456
+      });
+      expect(mockOctokit.rest.repos.deleteRepoRuleset).toHaveBeenCalledWith({
+        owner: 'owner',
+        repo: 'repo',
+        ruleset_id: 789
+      });
+    });
+
+    test('should handle delete-unmanaged-rulesets in dry-run mode', async () => {
+      const rulesetConfig = {
+        name: 'ci',
+        target: 'branch',
+        enforcement: 'active',
+        rules: [{ type: 'deletion' }]
+      };
+
+      const existingRulesets = [
+        { id: 123, name: 'ci' },
+        { id: 456, name: 'ci2' }
+      ];
+
+      mockFs.readFileSync.mockReturnValue(JSON.stringify(rulesetConfig));
+      mockOctokit.rest.repos.getRepoRulesets.mockResolvedValue({
+        data: existingRulesets
+      });
+      mockOctokit.rest.repos.getRepoRuleset.mockResolvedValue({
+        data: {
+          id: 123,
+          name: 'ci',
+          target: 'branch',
+          enforcement: 'active',
+          rules: [{ type: 'deletion' }]
+        }
+      });
+
+      const result = await syncRepositoryRuleset(mockOctokit, 'owner/repo', './ruleset.json', true, true);
+
+      expect(result.success).toBe(true);
+      expect(result.ruleset).toBe('unchanged');
+      expect(result.deletedRulesets).toHaveLength(1);
+      expect(result.deletedRulesets[0].name).toBe('ci2');
+      expect(result.deletedRulesets[0].wouldDelete).toBe(true);
+      expect(result.deletedRulesets[0].deleted).toBe(false);
+      expect(mockOctokit.rest.repos.deleteRepoRuleset).not.toHaveBeenCalled();
+    });
+
+    test('should handle delete-unmanaged-rulesets in dry-run mode when updating', async () => {
+      const rulesetConfig = {
+        name: 'ci',
+        target: 'branch',
+        enforcement: 'active',
+        rules: [{ type: 'deletion' }]
+      };
+
+      const existingRulesets = [
+        { id: 123, name: 'ci' },
+        { id: 456, name: 'unmanaged-ruleset' }
+      ];
+
+      mockFs.readFileSync.mockReturnValue(JSON.stringify(rulesetConfig));
+      mockOctokit.rest.repos.getRepoRulesets.mockResolvedValue({
+        data: existingRulesets
+      });
+      mockOctokit.rest.repos.getRepoRuleset.mockResolvedValue({
+        data: {
+          id: 123,
+          name: 'ci',
+          target: 'branch',
+          enforcement: 'disabled', // Different from config, triggers update
+          rules: [{ type: 'deletion' }]
+        }
+      });
+
+      const result = await syncRepositoryRuleset(mockOctokit, 'owner/repo', './ruleset.json', true, true);
+
+      expect(result.success).toBe(true);
+      expect(result.ruleset).toBe('would-update');
+      expect(result.deletedRulesets).toHaveLength(1);
+      expect(result.deletedRulesets[0].name).toBe('unmanaged-ruleset');
+      expect(result.deletedRulesets[0].wouldDelete).toBe(true);
+      expect(result.deletedRulesets[0].deleted).toBe(false);
+      expect(mockOctokit.rest.repos.updateRepoRuleset).not.toHaveBeenCalled();
+      expect(mockOctokit.rest.repos.deleteRepoRuleset).not.toHaveBeenCalled();
+    });
+
+    test('should handle delete-unmanaged-rulesets in dry-run mode when creating', async () => {
+      const rulesetConfig = {
+        name: 'new-ruleset',
+        target: 'branch',
+        enforcement: 'active',
+        rules: [{ type: 'deletion' }]
+      };
+
+      const existingRulesets = [{ id: 456, name: 'unmanaged-ruleset' }];
+
+      mockFs.readFileSync.mockReturnValue(JSON.stringify(rulesetConfig));
+      mockOctokit.rest.repos.getRepoRulesets.mockResolvedValue({
+        data: existingRulesets
+      });
+
+      const result = await syncRepositoryRuleset(mockOctokit, 'owner/repo', './ruleset.json', true, true);
+
+      expect(result.success).toBe(true);
+      expect(result.ruleset).toBe('would-create');
+      expect(result.deletedRulesets).toHaveLength(1);
+      expect(result.deletedRulesets[0].name).toBe('unmanaged-ruleset');
+      expect(result.deletedRulesets[0].wouldDelete).toBe(true);
+      expect(result.deletedRulesets[0].deleted).toBe(false);
+      expect(mockOctokit.rest.repos.createRepoRuleset).not.toHaveBeenCalled();
+      expect(mockOctokit.rest.repos.deleteRepoRuleset).not.toHaveBeenCalled();
+    });
+
+    test('should not delete rulesets when delete-unmanaged-rulesets is disabled', async () => {
+      const rulesetConfig = {
+        name: 'ci',
+        target: 'branch',
+        enforcement: 'active',
+        rules: [{ type: 'deletion' }]
+      };
+
+      const existingRulesets = [
+        { id: 123, name: 'ci' },
+        { id: 456, name: 'ci2' }
+      ];
+
+      mockFs.readFileSync.mockReturnValue(JSON.stringify(rulesetConfig));
+      mockOctokit.rest.repos.getRepoRulesets.mockResolvedValue({
+        data: existingRulesets
+      });
+      mockOctokit.rest.repos.getRepoRuleset.mockResolvedValue({
+        data: {
+          id: 123,
+          name: 'ci',
+          target: 'branch',
+          enforcement: 'active',
+          rules: [{ type: 'deletion' }]
+        }
+      });
+
+      const result = await syncRepositoryRuleset(mockOctokit, 'owner/repo', './ruleset.json', false, false);
+
+      expect(result.success).toBe(true);
+      expect(result.ruleset).toBe('unchanged');
+      expect(result.deletedRulesets).toBeUndefined();
+      expect(mockOctokit.rest.repos.deleteRepoRuleset).not.toHaveBeenCalled();
+    });
+
+    test('should handle deletion errors gracefully when deleting unmanaged rulesets', async () => {
+      const rulesetConfig = {
+        name: 'ci',
+        target: 'branch',
+        enforcement: 'active',
+        rules: [{ type: 'deletion' }]
+      };
+
+      const existingRulesets = [
+        { id: 123, name: 'ci' },
+        { id: 456, name: 'ci2' }
+      ];
+
+      mockFs.readFileSync.mockReturnValue(JSON.stringify(rulesetConfig));
+      mockOctokit.rest.repos.getRepoRulesets.mockResolvedValue({
+        data: existingRulesets
+      });
+      mockOctokit.rest.repos.getRepoRuleset.mockResolvedValue({
+        data: {
+          id: 123,
+          name: 'ci',
+          target: 'branch',
+          enforcement: 'active',
+          rules: [{ type: 'deletion' }]
+        }
+      });
+      mockOctokit.rest.repos.deleteRepoRuleset.mockRejectedValue(new Error('Permission denied'));
+
+      const result = await syncRepositoryRuleset(mockOctokit, 'owner/repo', './ruleset.json', true, false);
+
+      expect(result.success).toBe(true);
+      expect(result.ruleset).toBe('unchanged');
+      expect(result.deletedRulesets).toHaveLength(1);
+      expect(result.deletedRulesets[0].name).toBe('ci2');
+      expect(result.deletedRulesets[0].deleted).toBe(false);
+      expect(result.deletedRulesets[0].error).toBe('Permission denied');
     });
   });
 
@@ -2639,6 +2955,404 @@ describe('Bulk GitHub Repository Settings Action', () => {
       expect(result.filesCreated).toContain('.github/workflows/release.yml');
       expect(result.filesUpdated).toContain('.github/workflows/ci.yml');
       expect(mockOctokit.rest.repos.createOrUpdateFileContents).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe('syncAutolinks', () => {
+    beforeEach(() => {
+      jest.clearAllMocks();
+      mockOctokit.rest.repos.listAutolinks.mockClear();
+      mockOctokit.rest.repos.createAutolink.mockClear();
+      mockOctokit.rest.repos.deleteAutolink.mockClear();
+    });
+
+    test('should create autolinks when none exist', async () => {
+      const autolinksConfig = {
+        autolinks: [
+          {
+            key_prefix: 'JIRA-',
+            url_template: 'https://jira.example.com/browse/JIRA-<num>',
+            is_alphanumeric: false
+          }
+        ]
+      };
+
+      mockFs.readFileSync.mockReturnValue(JSON.stringify(autolinksConfig));
+      mockOctokit.rest.repos.listAutolinks.mockResolvedValue({ data: [] });
+      mockOctokit.rest.repos.createAutolink.mockResolvedValue({});
+
+      const result = await syncAutolinks(mockOctokit, 'owner/repo', './autolinks.json', false);
+
+      expect(result.success).toBe(true);
+      expect(result.autolinks).toBe('updated');
+      expect(result.autolinksCreated).toContain('JIRA-');
+      expect(mockOctokit.rest.repos.listAutolinks).toHaveBeenCalledWith({
+        owner: 'owner',
+        repo: 'repo'
+      });
+      expect(mockOctokit.rest.repos.createAutolink).toHaveBeenCalledWith({
+        owner: 'owner',
+        repo: 'repo',
+        key_prefix: 'JIRA-',
+        url_template: 'https://jira.example.com/browse/JIRA-<num>',
+        is_alphanumeric: false
+      });
+    });
+
+    test('should delete autolinks not in config', async () => {
+      const autolinksConfig = {
+        autolinks: [
+          {
+            key_prefix: 'JIRA-',
+            url_template: 'https://jira.example.com/browse/JIRA-<num>',
+            is_alphanumeric: false
+          }
+        ]
+      };
+
+      const existingAutolinks = [
+        {
+          id: 123,
+          key_prefix: 'JIRA-',
+          url_template: 'https://jira.example.com/browse/JIRA-<num>',
+          is_alphanumeric: false
+        },
+        {
+          id: 456,
+          key_prefix: 'OLD-',
+          url_template: 'https://old.example.com/<num>',
+          is_alphanumeric: true
+        }
+      ];
+
+      mockFs.readFileSync.mockReturnValue(JSON.stringify(autolinksConfig));
+      mockOctokit.rest.repos.listAutolinks.mockResolvedValue({ data: existingAutolinks });
+      mockOctokit.rest.repos.deleteAutolink.mockResolvedValue({});
+
+      const result = await syncAutolinks(mockOctokit, 'owner/repo', './autolinks.json', false);
+
+      expect(result.success).toBe(true);
+      expect(result.autolinks).toBe('updated');
+      expect(result.autolinksDeleted).toContain('OLD-');
+      expect(result.autolinksUnchanged).toBe(1);
+      expect(mockOctokit.rest.repos.deleteAutolink).toHaveBeenCalledWith({
+        owner: 'owner',
+        repo: 'repo',
+        autolink_id: 456
+      });
+      expect(mockOctokit.rest.repos.createAutolink).not.toHaveBeenCalled();
+    });
+
+    test('should update autolink with same prefix but different settings', async () => {
+      const autolinksConfig = {
+        autolinks: [
+          {
+            key_prefix: 'JIRA-',
+            url_template: 'https://jira-new.example.com/browse/JIRA-<num>',
+            is_alphanumeric: false
+          }
+        ]
+      };
+
+      const existingAutolinks = [
+        {
+          id: 123,
+          key_prefix: 'JIRA-',
+          url_template: 'https://jira-old.example.com/browse/JIRA-<num>',
+          is_alphanumeric: false
+        }
+      ];
+
+      mockFs.readFileSync.mockReturnValue(JSON.stringify(autolinksConfig));
+      mockOctokit.rest.repos.listAutolinks.mockResolvedValue({ data: existingAutolinks });
+      mockOctokit.rest.repos.deleteAutolink.mockResolvedValue({});
+      mockOctokit.rest.repos.createAutolink.mockResolvedValue({});
+
+      const result = await syncAutolinks(mockOctokit, 'owner/repo', './autolinks.json', false);
+
+      expect(result.success).toBe(true);
+      expect(result.autolinks).toBe('updated');
+      expect(result.autolinksDeleted).toContain('JIRA-');
+      expect(result.autolinksCreated).toContain('JIRA-');
+      expect(mockOctokit.rest.repos.deleteAutolink).toHaveBeenCalledWith({
+        owner: 'owner',
+        repo: 'repo',
+        autolink_id: 123
+      });
+      expect(mockOctokit.rest.repos.createAutolink).toHaveBeenCalledWith({
+        owner: 'owner',
+        repo: 'repo',
+        key_prefix: 'JIRA-',
+        url_template: 'https://jira-new.example.com/browse/JIRA-<num>',
+        is_alphanumeric: false
+      });
+    });
+
+    test('should not change when autolinks are already up to date', async () => {
+      const autolinksConfig = {
+        autolinks: [
+          {
+            key_prefix: 'JIRA-',
+            url_template: 'https://jira.example.com/browse/JIRA-<num>',
+            is_alphanumeric: false
+          }
+        ]
+      };
+
+      const existingAutolinks = [
+        {
+          id: 123,
+          key_prefix: 'JIRA-',
+          url_template: 'https://jira.example.com/browse/JIRA-<num>',
+          is_alphanumeric: false
+        }
+      ];
+
+      mockFs.readFileSync.mockReturnValue(JSON.stringify(autolinksConfig));
+      mockOctokit.rest.repos.listAutolinks.mockResolvedValue({ data: existingAutolinks });
+
+      const result = await syncAutolinks(mockOctokit, 'owner/repo', './autolinks.json', false);
+
+      expect(result.success).toBe(true);
+      expect(result.autolinks).toBe('unchanged');
+      expect(result.autolinksUnchanged).toBe(1);
+      expect(result.message).toContain('already up to date');
+      expect(mockOctokit.rest.repos.deleteAutolink).not.toHaveBeenCalled();
+      expect(mockOctokit.rest.repos.createAutolink).not.toHaveBeenCalled();
+    });
+
+    test('should handle multiple autolinks', async () => {
+      const autolinksConfig = {
+        autolinks: [
+          {
+            key_prefix: 'JIRA-',
+            url_template: 'https://jira.example.com/browse/JIRA-<num>',
+            is_alphanumeric: false
+          },
+          {
+            key_prefix: 'TICKET-',
+            url_template: 'https://tickets.example.com/view/<num>',
+            is_alphanumeric: true
+          }
+        ]
+      };
+
+      mockFs.readFileSync.mockReturnValue(JSON.stringify(autolinksConfig));
+      mockOctokit.rest.repos.listAutolinks.mockResolvedValue({ data: [] });
+      mockOctokit.rest.repos.createAutolink.mockResolvedValue({});
+
+      const result = await syncAutolinks(mockOctokit, 'owner/repo', './autolinks.json', false);
+
+      expect(result.success).toBe(true);
+      expect(result.autolinks).toBe('updated');
+      expect(result.autolinksCreated).toContain('JIRA-');
+      expect(result.autolinksCreated).toContain('TICKET-');
+      expect(mockOctokit.rest.repos.createAutolink).toHaveBeenCalledTimes(2);
+    });
+
+    test('should handle dry-run mode for creation', async () => {
+      const autolinksConfig = {
+        autolinks: [
+          {
+            key_prefix: 'JIRA-',
+            url_template: 'https://jira.example.com/browse/JIRA-<num>',
+            is_alphanumeric: false
+          }
+        ]
+      };
+
+      mockFs.readFileSync.mockReturnValue(JSON.stringify(autolinksConfig));
+      mockOctokit.rest.repos.listAutolinks.mockResolvedValue({ data: [] });
+
+      const result = await syncAutolinks(mockOctokit, 'owner/repo', './autolinks.json', true);
+
+      expect(result.success).toBe(true);
+      expect(result.autolinks).toBe('would-update');
+      expect(result.dryRun).toBe(true);
+      expect(result.autolinksWouldCreate).toContain('JIRA-');
+      expect(mockOctokit.rest.repos.createAutolink).not.toHaveBeenCalled();
+      expect(mockOctokit.rest.repos.deleteAutolink).not.toHaveBeenCalled();
+    });
+
+    test('should handle dry-run mode for deletion', async () => {
+      const autolinksConfig = {
+        autolinks: []
+      };
+
+      const existingAutolinks = [
+        {
+          id: 123,
+          key_prefix: 'OLD-',
+          url_template: 'https://old.example.com/<num>',
+          is_alphanumeric: true
+        }
+      ];
+
+      mockFs.readFileSync.mockReturnValue(JSON.stringify(autolinksConfig));
+      mockOctokit.rest.repos.listAutolinks.mockResolvedValue({ data: existingAutolinks });
+
+      const result = await syncAutolinks(mockOctokit, 'owner/repo', './autolinks.json', true);
+
+      expect(result.success).toBe(true);
+      expect(result.autolinks).toBe('would-update');
+      expect(result.dryRun).toBe(true);
+      expect(result.autolinksWouldDelete).toContain('OLD-');
+      expect(mockOctokit.rest.repos.createAutolink).not.toHaveBeenCalled();
+      expect(mockOctokit.rest.repos.deleteAutolink).not.toHaveBeenCalled();
+    });
+
+    test('should handle invalid repository format', async () => {
+      const result = await syncAutolinks(mockOctokit, 'invalid-repo-format', './autolinks.json', false);
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('Invalid repository format');
+    });
+
+    test('should handle missing autolinks file', async () => {
+      mockFs.readFileSync.mockImplementation(() => {
+        throw new Error('ENOENT: no such file or directory');
+      });
+
+      const result = await syncAutolinks(mockOctokit, 'owner/repo', './nonexistent.json', false);
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('Failed to read or parse autolinks file');
+    });
+
+    test('should handle invalid JSON in autolinks file', async () => {
+      mockFs.readFileSync.mockReturnValue('not valid json');
+
+      const result = await syncAutolinks(mockOctokit, 'owner/repo', './autolinks.json', false);
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('Failed to read or parse autolinks file');
+    });
+
+    test('should handle missing autolinks array in config', async () => {
+      mockFs.readFileSync.mockReturnValue(JSON.stringify({ links: [] }));
+
+      const result = await syncAutolinks(mockOctokit, 'owner/repo', './autolinks.json', false);
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('must contain an "autolinks" array');
+    });
+
+    test('should handle missing required fields in autolink', async () => {
+      const autolinksConfig = {
+        autolinks: [
+          {
+            key_prefix: 'JIRA-'
+            // Missing url_template
+          }
+        ]
+      };
+
+      mockFs.readFileSync.mockReturnValue(JSON.stringify(autolinksConfig));
+
+      const result = await syncAutolinks(mockOctokit, 'owner/repo', './autolinks.json', false);
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('must have "key_prefix" and "url_template" fields');
+    });
+
+    test('should handle 404 error when listing autolinks', async () => {
+      const autolinksConfig = {
+        autolinks: [
+          {
+            key_prefix: 'JIRA-',
+            url_template: 'https://jira.example.com/browse/JIRA-<num>',
+            is_alphanumeric: false
+          }
+        ]
+      };
+
+      mockFs.readFileSync.mockReturnValue(JSON.stringify(autolinksConfig));
+      mockOctokit.rest.repos.listAutolinks.mockRejectedValue({ status: 404 });
+      mockOctokit.rest.repos.createAutolink.mockResolvedValue({});
+
+      const result = await syncAutolinks(mockOctokit, 'owner/repo', './autolinks.json', false);
+
+      expect(result.success).toBe(true);
+      expect(result.autolinks).toBe('updated');
+      expect(mockOctokit.rest.repos.createAutolink).toHaveBeenCalled();
+    });
+
+    test('should handle API errors', async () => {
+      const autolinksConfig = {
+        autolinks: [
+          {
+            key_prefix: 'JIRA-',
+            url_template: 'https://jira.example.com/browse/JIRA-<num>',
+            is_alphanumeric: false
+          }
+        ]
+      };
+
+      mockFs.readFileSync.mockReturnValue(JSON.stringify(autolinksConfig));
+      mockOctokit.rest.repos.listAutolinks.mockRejectedValue(new Error('API rate limit exceeded'));
+
+      const result = await syncAutolinks(mockOctokit, 'owner/repo', './autolinks.json', false);
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('Failed to sync autolinks');
+    });
+
+    test('should default is_alphanumeric to true when not specified', async () => {
+      const autolinksConfig = {
+        autolinks: [
+          {
+            key_prefix: 'JIRA-',
+            url_template: 'https://jira.example.com/browse/JIRA-<num>'
+            // is_alphanumeric not specified
+          }
+        ]
+      };
+
+      mockFs.readFileSync.mockReturnValue(JSON.stringify(autolinksConfig));
+      mockOctokit.rest.repos.listAutolinks.mockResolvedValue({ data: [] });
+      mockOctokit.rest.repos.createAutolink.mockResolvedValue({});
+
+      const result = await syncAutolinks(mockOctokit, 'owner/repo', './autolinks.json', false);
+
+      expect(result.success).toBe(true);
+      expect(mockOctokit.rest.repos.createAutolink).toHaveBeenCalledWith({
+        owner: 'owner',
+        repo: 'repo',
+        key_prefix: 'JIRA-',
+        url_template: 'https://jira.example.com/browse/JIRA-<num>',
+        is_alphanumeric: true
+      });
+    });
+
+    test('should match autolink with default is_alphanumeric as unchanged', async () => {
+      const autolinksConfig = {
+        autolinks: [
+          {
+            key_prefix: 'JIRA-',
+            url_template: 'https://jira.example.com/browse/JIRA-<num>'
+            // is_alphanumeric not specified (defaults to true)
+          }
+        ]
+      };
+
+      const existingAutolinks = [
+        {
+          id: 123,
+          key_prefix: 'JIRA-',
+          url_template: 'https://jira.example.com/browse/JIRA-<num>',
+          is_alphanumeric: true
+        }
+      ];
+
+      mockFs.readFileSync.mockReturnValue(JSON.stringify(autolinksConfig));
+      mockOctokit.rest.repos.listAutolinks.mockResolvedValue({ data: existingAutolinks });
+
+      const result = await syncAutolinks(mockOctokit, 'owner/repo', './autolinks.json', false);
+
+      expect(result.success).toBe(true);
+      expect(result.autolinks).toBe('unchanged');
+      expect(mockOctokit.rest.repos.createAutolink).not.toHaveBeenCalled();
+      expect(mockOctokit.rest.repos.deleteAutolink).not.toHaveBeenCalled();
     });
   });
 });

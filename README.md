@@ -22,6 +22,7 @@ Update repository settings in bulk across multiple GitHub repositories.
 - 📋 **Sync repository rulesets** across repositories
 - 📝 **Sync pull request templates** across repositories via pull requests
 - 🔧 **Sync workflow files** across repositories via pull requests
+- 🔗 **Sync autolink references** across repositories
 - 📋 Support multiple repository input methods (comma-separated, YAML file, or all org repos)
 - 🔍 **Dry-run mode** with change preview and intelligent change detection
 - 📋 **Per-repository overrides** via YAML configuration
@@ -45,6 +46,7 @@ Update repository settings in bulk across multiple GitHub repositories.
     dependabot-yml: './config/dependabot/npm-actions.yml'
     rulesets-file: './config/rulesets/prod-ruleset.json'
     pull-request-template: './config/templates/pull_request_template.md'
+    autolinks-file: './config/autolinks/jira-autolinks.json'
     topics: 'javascript,github-actions,automation'
     dry-run: ${{ github.event_name == 'pull_request' }} # dry run if PR
 ```
@@ -188,6 +190,29 @@ repos:
 
 For more information on ruleset configuration, see the [GitHub Rulesets documentation](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/about-rulesets).
 
+### Delete Unmanaged Rulesets
+
+By default, syncing rulesets will create or update the specified ruleset by name, but will not delete other rulesets that may exist in the repository. To delete all other rulesets besides the one being synced, use the `delete-unmanaged-rulesets` parameter:
+
+```yml
+- name: Sync Repository Rulesets (delete unmanaged)
+  uses: joshjohanning/bulk-github-repo-settings-sync-action@v1
+  with:
+    github-token: ${{ steps.app-token.outputs.token }}
+    repositories-file: 'repos.yml'
+    rulesets-file: './config/rulesets/ci-ruleset.json'
+    delete-unmanaged-rulesets: true
+```
+
+**Behavior with `delete-unmanaged-rulesets: true`:**
+
+- Creates the ruleset if it doesn't exist
+- Updates the ruleset if a ruleset with the same name already exists
+- **Deletes all other rulesets that don't match the synced ruleset name**
+- In dry-run mode, shows which rulesets would be deleted without actually deleting them
+
+**Use case:** This is useful when you rename a ruleset and want to ensure only the new ruleset exists, or when you want to enforce that repositories have exactly one specific ruleset configuration.
+
 ### Syncing Pull Request Templates
 
 Sync a pull request template file to `.github/pull_request_template.md` in target repositories via pull requests:
@@ -264,6 +289,66 @@ repos:
 
 For more information on GitHub Actions workflows, see the [GitHub Actions documentation](https://docs.github.com/en/actions/using-workflows).
 
+### Syncing Autolink References
+
+Sync autolink references across multiple repositories to automatically link keywords to external URLs (e.g., JIRA issues):
+
+```yml
+- name: Sync Autolinks
+  uses: joshjohanning/bulk-github-repo-settings-sync-action@v1
+  with:
+    github-token: ${{ steps.app-token.outputs.token }}
+    repositories-file: 'repos.yml'
+    autolinks-file: './config/autolinks/jira-autolinks.json'
+```
+
+Or with repo-specific overrides in `repos.yml`:
+
+```yaml
+repos:
+  - repo: owner/repo1
+    autolinks-file: './config/autolinks/jira-autolinks.json'
+  - repo: owner/repo2
+    autolinks-file: './config/autolinks/ado-autolinks.json'
+  - repo: owner/repo3
+    # Skip autolinks sync for this repo
+```
+
+**Behavior:**
+
+- Creates autolinks that don't exist in the repository
+- Updates autolinks that have the same key prefix but different URL template or settings
+- Deletes autolinks that exist in the repository but not in the configuration
+- If all autolinks match, no changes are made
+- Autolinks are applied directly via the GitHub API (not via pull request)
+
+**Example Autolinks JSON (`jira-autolinks.json`):**
+
+```json
+{
+  "autolinks": [
+    {
+      "key_prefix": "JIRA-",
+      "url_template": "https://jira.example.com/browse/JIRA-<num>",
+      "is_alphanumeric": false
+    },
+    {
+      "key_prefix": "TICKET-",
+      "url_template": "https://tickets.example.com/view/<num>",
+      "is_alphanumeric": true
+    }
+  ]
+}
+```
+
+| Field             | Description                                                                                  | Required             |
+| ----------------- | -------------------------------------------------------------------------------------------- | -------------------- |
+| `key_prefix`      | The prefix to match in text (e.g., `JIRA-` matches `JIRA-123`)                               | Yes                  |
+| `url_template`    | The URL template with `<num>` placeholder for the reference number                           | Yes                  |
+| `is_alphanumeric` | Whether the reference can include alphanumeric characters (`true`) or only numbers (`false`) | No (default: `true`) |
+
+For more information on autolinks, see the [GitHub documentation](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/managing-repository-settings/configuring-autolinks-to-reference-external-resources).
+
 ### Organization-wide Updates
 
 ```yml
@@ -324,10 +409,12 @@ Output shows what would change:
 | `dependabot-yml`                 | Path to a dependabot.yml file to sync to `.github/dependabot.yml` in target repositories                                                   | No       | -                                     |
 | `dependabot-pr-title`            | Title for pull requests when updating dependabot.yml                                                                                       | No       | `chore: update dependabot.yml`        |
 | `rulesets-file`                  | Path to a JSON file containing repository ruleset configuration to sync to target repositories                                             | No       | -                                     |
+| `delete-unmanaged-rulesets`      | Delete all other rulesets besides the one being synced                                                                                     | No       | `false`                               |
 | `pull-request-template`          | Path to a pull request template file to sync to `.github/pull_request_template.md` in target repositories                                  | No       | -                                     |
 | `pull-request-template-pr-title` | Title for pull requests when updating pull request template                                                                                | No       | `chore: update pull request template` |
 | `workflow-files`                 | Comma-separated list of workflow file paths to sync to `.github/workflows/` in target repositories                                         | No       | -                                     |
 | `workflow-files-pr-title`        | Title for pull requests when updating workflow files                                                                                       | No       | `chore: sync workflow configuration`  |
+| `autolinks-file`                 | Path to a JSON file containing autolink references to sync to target repositories                                                          | No       | -                                     |
 | `dry-run`                        | Preview changes without applying them (logs what would be changed)                                                                         | No       | `false`                               |
 
 \* Either `repositories` or `repositories-file` must be provided
@@ -410,6 +497,7 @@ repos:
     workflow-files:
       - './config/workflows/ci.yml'
       - './config/workflows/release.yml'
+    autolinks-file: './config/autolinks/jira-autolinks.json'
 ```
 
 **Priority:** Repository-specific settings override global defaults from action inputs.
@@ -424,6 +512,7 @@ repos:
 - Pull request templates are synced to `.github/pull_request_template.md` (standard location)
 - Workflow files syncing creates pull requests for review before merging
 - Workflow files are synced to `.github/workflows/<filename>` (preserving the original filename)
+- Autolink references are synced directly via the API (autolinks not in config are **deleted** from repo)
 - Failed updates are logged as warnings but don't fail the action
 - **Access denied repositories are skipped with warnings** - ensure your GitHub App has:
   - Repository Administration permissions
