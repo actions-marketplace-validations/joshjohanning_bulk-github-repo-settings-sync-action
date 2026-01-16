@@ -34,7 +34,86 @@ import * as core from '@actions/core';
 import { Octokit } from '@octokit/rest';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as url from 'url';
 import * as yaml from 'js-yaml';
+
+/**
+ * Get the known configuration keys from action.yml.
+ * This dynamically reads the action.yml file to determine valid input keys,
+ * avoiding the need to maintain a hardcoded list.
+ * @returns {Set<string>} Set of valid configuration keys
+ */
+function getKnownRepoConfigKeys() {
+  // 'repo' is always valid as it's the repository identifier in YAML config
+  const keys = new Set(['repo']);
+
+  try {
+    // Get the directory where this script is located
+    const __filename = url.fileURLToPath(import.meta.url);
+    const __dirname = path.dirname(__filename);
+
+    // action.yml is in the root directory (parent of src/)
+    const actionYmlPath = path.join(__dirname, '..', 'action.yml');
+    const actionYmlContent = fs.readFileSync(actionYmlPath, 'utf8');
+    const actionConfig = yaml.load(actionYmlContent);
+
+    if (actionConfig?.inputs) {
+      for (const inputName of Object.keys(actionConfig.inputs)) {
+        keys.add(inputName);
+      }
+    }
+  } catch (error) {
+    // If we can't read action.yml, log a warning but don't fail
+    // This allows the action to still work even if there's an issue
+    core.warning(`Could not read action.yml to determine valid configuration keys: ${error.message}`);
+  }
+
+  return keys;
+}
+
+// Cache the known keys to avoid re-reading action.yml multiple times
+let _knownRepoConfigKeys = null;
+
+/**
+ * Get cached known configuration keys
+ * @returns {Set<string>} Set of valid configuration keys
+ */
+function getCachedKnownRepoConfigKeys() {
+  if (_knownRepoConfigKeys === null) {
+    _knownRepoConfigKeys = getKnownRepoConfigKeys();
+  }
+  return _knownRepoConfigKeys;
+}
+
+/**
+ * Reset the known repo config keys cache.
+ * Exported for testing purposes to ensure test isolation.
+ */
+export function resetKnownRepoConfigKeysCache() {
+  _knownRepoConfigKeys = null;
+}
+
+/**
+ * Validate repository configuration and warn about unknown keys
+ * @param {Object} repoConfig - Repository configuration object from YAML
+ * @param {string} repoName - Repository name for logging context
+ */
+function validateRepoConfig(repoConfig, repoName) {
+  if (typeof repoConfig !== 'object' || repoConfig === null) {
+    return;
+  }
+
+  const knownKeys = getCachedKnownRepoConfigKeys();
+
+  for (const key of Object.keys(repoConfig)) {
+    if (!knownKeys.has(key)) {
+      core.warning(
+        `⚠️  Unknown configuration key "${key}" found for repository "${repoName}". ` +
+          `This setting may not exist, may not be available in this version, or may have a typo.`
+      );
+    }
+  }
+}
 
 /**
  * Get input value (works reliably in both GitHub Actions and local environments)
@@ -89,7 +168,8 @@ export async function parseRepositories(repositories, repositoriesFile, owner, o
             // Simple string format: just repo name
             return { repo: item };
           } else if (typeof item === 'object' && item.repo) {
-            // Object format with repo and optional settings
+            // Object format with repo and optional settings - validate config keys
+            validateRepoConfig(item, item.repo);
             return item;
           } else {
             throw new Error('Each item in repos array must be a string or object with "repo" property');
@@ -538,11 +618,15 @@ export async function updateRepositorySettings(
  * @param {string} options.prBodyUpdate - PR body when updating existing file(s)
  * @param {string} options.resultKey - Key for the result status (e.g., 'dependabotYml', 'pullRequestTemplate', 'workflowFiles')
  * @param {string} options.fileDescription - Human-readable description of the file(s) (for error messages)
+ * @param {Object} [options.contentProcessor] - Optional processor for custom content handling (e.g., preserving repo-specific sections)
+ * @param {Function} [options.contentProcessor.getComparableExisting] - (existingContent) => content to compare against source
+ * @param {Function} [options.contentProcessor.getFinalContent] - (sourceContent, existingContent) => content to commit
  * @param {boolean} dryRun - Preview mode without making actual changes
  * @returns {Promise<Object>} Result object
  */
 export async function syncFilesViaPullRequest(octokit, repo, options, dryRun) {
-  const { files, branchName, prTitle, prBodyCreate, prBodyUpdate, resultKey, fileDescription } = options;
+  const { files, branchName, prTitle, prBodyCreate, prBodyUpdate, resultKey, fileDescription, contentProcessor } =
+    options;
 
   const [owner, repoName] = repo.split('/');
 
@@ -608,13 +692,25 @@ export async function syncFilesViaPullRequest(octokit, repo, options, dryRun) {
         }
       }
 
-      // Compare content
-      const needsUpdate = !existingContent || existingContent.trim() !== fileInfo.content.trim();
+      // Compare content - use contentProcessor if provided to handle special cases like repo-specific sections
+      let comparableExisting = existingContent;
+      let finalContent = fileInfo.content;
+
+      if (contentProcessor && existingContent) {
+        // Get the comparable portion of existing content (e.g., strip repo-specific sections)
+        comparableExisting = contentProcessor.getComparableExisting(existingContent);
+        // Get the final content to commit (e.g., merge source with repo-specific sections)
+        finalContent = contentProcessor.getFinalContent(fileInfo.content, existingContent);
+      }
+
+      const needsUpdate = !existingContent || comparableExisting.trim() !== fileInfo.content.trim();
 
       if (needsUpdate) {
         filesToUpdate.push({
           ...fileInfo,
           existingSha,
+          existingContent,
+          finalContent,
           isNew: !existingContent
         });
       }
@@ -747,12 +843,15 @@ export async function syncFilesViaPullRequest(octokit, repo, options, dryRun) {
     for (const file of filesToUpdate) {
       const commitMessage = file.isNew ? `chore: add ${file.targetPath}` : `chore: update ${file.targetPath}`;
 
+      // Use finalContent if available (from contentProcessor), otherwise use original content
+      const contentToCommit = file.finalContent || file.content;
+
       await octokit.rest.repos.createOrUpdateFileContents({
         owner,
         repo: repoName,
         path: file.targetPath,
         message: commitMessage,
-        content: Buffer.from(file.content).toString('base64'),
+        content: Buffer.from(contentToCommit).toString('base64'),
         branch: branchName,
         sha: file.existingSha || undefined
       });
@@ -876,6 +975,381 @@ export async function syncDependabotYml(octokit, repo, dependabotYmlPath, prTitl
     },
     dryRun
   );
+}
+
+/**
+ * Content processor for .gitignore files that preserves repository-specific entries.
+ * Repository-specific entries are marked with a special comment marker and are
+ * preserved when syncing the base gitignore content.
+ */
+const gitignoreContentProcessor = {
+  marker: '# Repository-specific entries (preserved during sync)',
+
+  /**
+   * Get the comparable portion of existing content (everything before the marker)
+   * @param {string} existingContent - The existing file content
+   * @returns {string} Content to compare against source
+   */
+  getComparableExisting(existingContent) {
+    const markerIndex = existingContent.indexOf(this.marker);
+    if (markerIndex === -1) {
+      return existingContent;
+    }
+    return existingContent.substring(0, markerIndex).trimEnd();
+  },
+
+  /**
+   * Get the final content to commit (source + preserved repo-specific entries)
+   * @param {string} sourceContent - The source file content
+   * @param {string} existingContent - The existing file content
+   * @returns {string} Final content to commit
+   */
+  getFinalContent(sourceContent, existingContent) {
+    const markerIndex = existingContent.indexOf(this.marker);
+    if (markerIndex === -1) {
+      // No repo-specific content, just use source
+      let finalContent = sourceContent.trim();
+      if (!finalContent.endsWith('\n')) {
+        finalContent += '\n';
+      }
+      return finalContent;
+    }
+
+    // Extract and preserve repo-specific content
+    const repoSpecificContent = existingContent.substring(markerIndex);
+    let finalContent = sourceContent.trim();
+
+    // Ensure there's a blank line before the repo-specific section
+    if (!finalContent.endsWith('\n')) {
+      finalContent += '\n';
+    }
+    if (!finalContent.endsWith('\n\n')) {
+      finalContent += '\n';
+    }
+    finalContent += repoSpecificContent;
+
+    // Ensure file ends with a newline
+    if (!finalContent.endsWith('\n')) {
+      finalContent += '\n';
+    }
+
+    return finalContent;
+  }
+};
+
+/**
+ * Sync .gitignore file to target repository
+ * This function handles .gitignore specially to preserve repository-specific entries
+ * that are marked with a special comment marker.
+ * @param {Octokit} octokit - Octokit instance
+ * @param {string} repo - Repository in "owner/repo" format
+ * @param {string} gitignorePath - Path to local .gitignore file
+ * @param {string} prTitle - Title for the pull request
+ * @param {boolean} dryRun - Preview mode without making actual changes
+ * @returns {Promise<Object>} Result object
+ */
+export async function syncGitignore(octokit, repo, gitignorePath, prTitle, dryRun) {
+  return syncFileViaPullRequest(
+    octokit,
+    repo,
+    {
+      sourceFilePath: gitignorePath,
+      targetPath: '.gitignore',
+      branchName: 'gitignore-sync',
+      prTitle,
+      prBodyCreate: `This PR adds \`.gitignore\` to the repository.\n\n**Changes:**\n- Added .gitignore configuration`,
+      prBodyUpdate: `This PR updates \`.gitignore\` to the latest version.\n\n**Changes:**\n- Updated .gitignore configuration\n- Repository-specific entries have been preserved`,
+      resultKey: 'gitignore',
+      fileDescription: '.gitignore',
+      contentProcessor: gitignoreContentProcessor
+    },
+    dryRun
+  );
+}
+
+/**
+ * Deep comparison of objects for package.json fields
+ * @param {*} obj1 - First object to compare
+ * @param {*} obj2 - Second object to compare
+ * @returns {boolean} True if objects are equal
+ */
+function deepEqual(obj1, obj2) {
+  if (obj1 === obj2) return true;
+  if (obj1 === null || obj2 === null) return obj1 === obj2;
+  if (typeof obj1 !== 'object' || typeof obj2 !== 'object') return false;
+
+  const keys1 = Object.keys(obj1).sort();
+  const keys2 = Object.keys(obj2).sort();
+
+  if (keys1.length !== keys2.length) return false;
+  if (keys1.join(',') !== keys2.join(',')) return false;
+
+  return keys1.every(key => deepEqual(obj1[key], obj2[key]));
+}
+
+/**
+ * Sync package.json fields (scripts and/or engines) to target repository via PR
+ * This function merges selected fields from a source package.json into the target,
+ * preserving all other fields in the target package.json.
+ * @param {Octokit} octokit - Octokit instance
+ * @param {string} repo - Repository in "owner/repo" format
+ * @param {string} packageJsonPath - Path to local package.json file
+ * @param {boolean} syncScripts - Whether to sync the scripts field
+ * @param {boolean} syncEngines - Whether to sync the engines field
+ * @param {string} prTitle - Title for the pull request
+ * @param {boolean} dryRun - Preview mode without making actual changes
+ * @returns {Promise<Object>} Result object
+ */
+export async function syncPackageJson(octokit, repo, packageJsonPath, syncScripts, syncEngines, prTitle, dryRun) {
+  const [owner, repoName] = repo.split('/');
+  const targetPath = 'package.json';
+  const branchName = 'package-json-sync';
+
+  if (!owner || !repoName) {
+    return {
+      repository: repo,
+      success: false,
+      error: 'Invalid repository format. Expected "owner/repo"',
+      dryRun
+    };
+  }
+
+  if (!syncScripts && !syncEngines) {
+    return {
+      repository: repo,
+      success: false,
+      error: 'At least one of syncScripts or syncEngines must be enabled',
+      dryRun
+    };
+  }
+
+  try {
+    // Read and parse the source package.json file
+    let sourcePackageJson;
+    try {
+      const sourceContent = fs.readFileSync(packageJsonPath, 'utf8');
+      sourcePackageJson = JSON.parse(sourceContent);
+    } catch (error) {
+      return {
+        repository: repo,
+        success: false,
+        error: `Failed to read or parse package.json file at ${packageJsonPath}: ${error.message}`,
+        dryRun
+      };
+    }
+
+    // Get default branch
+    const { data: repoData } = await octokit.rest.repos.get({
+      owner,
+      repo: repoName
+    });
+    const defaultBranch = repoData.default_branch;
+
+    // Check if package.json exists in the target repo
+    let existingPackageJson = null;
+    let existingSha = null;
+
+    try {
+      const { data } = await octokit.rest.repos.getContent({
+        owner,
+        repo: repoName,
+        path: targetPath,
+        ref: defaultBranch
+      });
+      existingSha = data.sha;
+      const existingContent = Buffer.from(data.content, 'base64').toString('utf8');
+      existingPackageJson = JSON.parse(existingContent);
+    } catch (error) {
+      if (error.status === 404) {
+        return {
+          repository: repo,
+          success: false,
+          error: `${targetPath} does not exist in ${repo}. This action only updates existing package.json files.`,
+          dryRun
+        };
+      }
+      throw error;
+    }
+
+    // Build updated package.json by merging selected fields
+    const updatedPackageJson = { ...existingPackageJson };
+    const changes = [];
+
+    // Check and update scripts if enabled
+    if (syncScripts) {
+      const sourceScripts = sourcePackageJson.scripts || {};
+      const existingScripts = existingPackageJson.scripts || {};
+
+      if (!deepEqual(sourceScripts, existingScripts)) {
+        updatedPackageJson.scripts = sourceScripts;
+        changes.push({
+          field: 'scripts',
+          from: Object.keys(existingScripts).length,
+          to: Object.keys(sourceScripts).length
+        });
+      }
+    }
+
+    // Check and update engines if enabled
+    if (syncEngines) {
+      const sourceEngines = sourcePackageJson.engines || {};
+      const existingEngines = existingPackageJson.engines || {};
+
+      if (!deepEqual(sourceEngines, existingEngines)) {
+        updatedPackageJson.engines = sourceEngines;
+        changes.push({
+          field: 'engines',
+          from: JSON.stringify(existingEngines),
+          to: JSON.stringify(sourceEngines)
+        });
+      }
+    }
+
+    // If no changes needed, return early
+    if (changes.length === 0) {
+      return {
+        repository: repo,
+        success: true,
+        packageJson: 'unchanged',
+        message: `${targetPath} is already up to date`,
+        dryRun
+      };
+    }
+
+    // Check if there's already an open PR for this update
+    let existingPR = null;
+    try {
+      const { data: pulls } = await octokit.rest.pulls.list({
+        owner,
+        repo: repoName,
+        state: 'open',
+        head: `${owner}:${branchName}`
+      });
+
+      if (pulls.length > 0) {
+        existingPR = pulls[0];
+        core.info(`  🔄 Found existing open PR #${existingPR.number} for ${targetPath}`);
+      }
+    } catch (error) {
+      core.warning(`  ⚠️  Could not check for existing PRs: ${error.message}`);
+    }
+
+    if (existingPR) {
+      return {
+        repository: repo,
+        success: true,
+        packageJson: 'pr-exists',
+        message: `Open PR #${existingPR.number} already exists for ${targetPath}`,
+        prNumber: existingPR.number,
+        prUrl: existingPR.html_url,
+        changes,
+        dryRun
+      };
+    }
+
+    if (dryRun) {
+      return {
+        repository: repo,
+        success: true,
+        packageJson: 'would-update',
+        message: `Would update ${targetPath} via PR`,
+        changes,
+        dryRun
+      };
+    }
+
+    // Create or update the branch
+    let branchExists = false;
+    try {
+      await octokit.rest.git.getRef({
+        owner,
+        repo: repoName,
+        ref: `heads/${branchName}`
+      });
+      branchExists = true;
+    } catch (error) {
+      if (error.status !== 404) {
+        throw error;
+      }
+    }
+
+    const { data: defaultRef } = await octokit.rest.git.getRef({
+      owner,
+      repo: repoName,
+      ref: `heads/${defaultBranch}`
+    });
+
+    if (!branchExists) {
+      await octokit.rest.git.createRef({
+        owner,
+        repo: repoName,
+        ref: `refs/heads/${branchName}`,
+        sha: defaultRef.object.sha
+      });
+      core.info(`  🌿 Created branch ${branchName}`);
+    } else {
+      await octokit.rest.git.updateRef({
+        owner,
+        repo: repoName,
+        ref: `heads/${branchName}`,
+        sha: defaultRef.object.sha,
+        force: true
+      });
+      core.info(`  🌿 Updated branch ${branchName}`);
+    }
+
+    // Commit the updated package.json
+    const newContent = `${JSON.stringify(updatedPackageJson, null, 2)}\n`;
+    await octokit.rest.repos.createOrUpdateFileContents({
+      owner,
+      repo: repoName,
+      path: targetPath,
+      message: `chore: update ${targetPath}`,
+      content: Buffer.from(newContent).toString('base64'),
+      branch: branchName,
+      sha: existingSha
+    });
+    core.info(`  ✍️  Committed changes to ${targetPath}`);
+
+    // Build PR body
+    let prBody = `This PR updates \`package.json\` with synchronized configuration.\n\n**Changes:**\n`;
+    for (const change of changes) {
+      if (change.field === 'scripts') {
+        prBody += `- Updated \`${change.field}\` (${change.from} → ${change.to} entries)\n`;
+      } else {
+        prBody += `- Updated \`${change.field}\` (${change.from} → ${change.to})\n`;
+      }
+    }
+
+    // Create PR
+    const { data: pr } = await octokit.rest.pulls.create({
+      owner,
+      repo: repoName,
+      title: prTitle,
+      head: branchName,
+      base: defaultBranch,
+      body: prBody
+    });
+    core.info(`  📬 Created PR #${pr.number}: ${pr.html_url}`);
+
+    return {
+      repository: repo,
+      success: true,
+      packageJson: 'updated',
+      prNumber: pr.number,
+      prUrl: pr.html_url,
+      message: `Updated ${targetPath} via PR #${pr.number}`,
+      changes,
+      dryRun
+    };
+  } catch (error) {
+    return {
+      repository: repo,
+      success: false,
+      error: `Failed to sync package.json: ${error.message}`,
+      dryRun
+    };
+  }
 }
 
 /**
@@ -1459,9 +1933,199 @@ export async function syncAutolinks(octokit, repo, autolinksFilePath, dryRun) {
 }
 
 /**
+ * Sync copilot-instructions.md file to target repository
+ * @param {Octokit} octokit - Octokit instance
+ * @param {string} repo - Repository in "owner/repo" format
+ * @param {string} copilotInstructionsPath - Path to local copilot-instructions.md file
+ * @param {string} prTitle - Title for the pull request
+ * @param {boolean} dryRun - Preview mode without making actual changes
+ * @returns {Promise<Object>} Result object
+ */
+export async function syncCopilotInstructions(octokit, repo, copilotInstructionsPath, prTitle, dryRun) {
+  return syncFileViaPullRequest(
+    octokit,
+    repo,
+    {
+      sourceFilePath: copilotInstructionsPath,
+      targetPath: '.github/copilot-instructions.md',
+      branchName: 'copilot-instructions-md-sync',
+      prTitle,
+      prBodyCreate: `This PR adds \`.github/copilot-instructions.md\` to configure GitHub Copilot.\n\n**Changes:**\n- Added Copilot instructions`,
+      prBodyUpdate: `This PR updates \`.github/copilot-instructions.md\` to the latest version.\n\n**Changes:**\n- Updated Copilot instructions`,
+      resultKey: 'copilotInstructions',
+      fileDescription: 'copilot-instructions.md'
+    },
+    dryRun
+  );
+}
+
+/**
+ * Get a list of specific changes made to a repository
+ * @param {Object} result - Repository update result object
+ * @param {boolean} dryRun - Whether this is a dry-run
+ * @returns {Array<string>} List of change descriptions
+ */
+function getChangesList(result, dryRun) {
+  const changes = [];
+  const wouldPrefix = dryRun ? 'Would update ' : '';
+
+  // Repository settings changes
+  if (result.changes && result.changes.length > 0) {
+    const settingNames = result.changes.map(c => c.setting.replace(/_/g, '-'));
+    changes.push(`${wouldPrefix}settings: ${settingNames.join(', ')}`);
+  }
+
+  // Topics changes
+  if (result.topicsChange) {
+    const topicChanges = [];
+    if (result.topicsChange.added.length > 0) {
+      topicChanges.push(`+${result.topicsChange.added.join(', ')}`);
+    }
+    if (result.topicsChange.removed.length > 0) {
+      topicChanges.push(`-${result.topicsChange.removed.join(', ')}`);
+    }
+    changes.push(`${wouldPrefix}topics: ${topicChanges.join(', ')}`);
+  }
+
+  // Code scanning changes
+  if (result.codeScanningChange) {
+    changes.push(`${wouldPrefix}CodeQL scanning`);
+  }
+
+  // Immutable releases changes
+  if (result.immutableReleasesChange) {
+    const action = result.immutableReleasesChange.to ? 'enable' : 'disable';
+    const actionText = dryRun ? `Would ${action}` : `${action.charAt(0).toUpperCase()}${action.slice(1)}d`;
+    changes.push(`${actionText} immutable releases`);
+  }
+
+  // Dependabot changes
+  if (
+    result.dependabotSync?.success &&
+    result.dependabotSync.dependabotYml &&
+    result.dependabotSync.dependabotYml !== 'unchanged'
+  ) {
+    const status = result.dependabotSync.dependabotYml;
+    if (status === 'pr-exists') {
+      changes.push(`dependabot.yml PR exists (#${result.dependabotSync.prNumber})`);
+    } else if (status.startsWith('would-')) {
+      changes.push(`Would sync dependabot.yml`);
+    } else {
+      changes.push(`${wouldPrefix}dependabot.yml (PR #${result.dependabotSync.prNumber})`);
+    }
+  }
+
+  // Gitignore changes
+  if (
+    result.gitignoreSync?.success &&
+    result.gitignoreSync.gitignore &&
+    result.gitignoreSync.gitignore !== 'unchanged'
+  ) {
+    const status = result.gitignoreSync.gitignore;
+    if (status === 'pr-exists') {
+      changes.push(`.gitignore PR exists (#${result.gitignoreSync.prNumber})`);
+    } else if (status.startsWith('would-')) {
+      changes.push(`Would sync .gitignore`);
+    } else {
+      changes.push(`${wouldPrefix}.gitignore (PR #${result.gitignoreSync.prNumber})`);
+    }
+  }
+
+  // Ruleset changes
+  if (result.rulesetSync?.success && result.rulesetSync.ruleset && result.rulesetSync.ruleset !== 'unchanged') {
+    const status = result.rulesetSync.ruleset;
+    if (status.startsWith('would-')) {
+      changes.push(`Would sync ruleset`);
+    } else {
+      changes.push(`${wouldPrefix}ruleset`);
+    }
+  }
+
+  // Pull request template changes
+  if (
+    result.pullRequestTemplateSync?.success &&
+    result.pullRequestTemplateSync.pullRequestTemplate &&
+    result.pullRequestTemplateSync.pullRequestTemplate !== 'unchanged'
+  ) {
+    const status = result.pullRequestTemplateSync.pullRequestTemplate;
+    if (status === 'pr-exists') {
+      changes.push(`PR template PR exists (#${result.pullRequestTemplateSync.prNumber})`);
+    } else if (status.startsWith('would-')) {
+      changes.push(`Would sync PR template`);
+    } else {
+      changes.push(`${wouldPrefix}PR template (PR #${result.pullRequestTemplateSync.prNumber})`);
+    }
+  }
+
+  // Workflow files changes
+  if (
+    result.workflowFilesSync?.success &&
+    result.workflowFilesSync.workflowFiles &&
+    result.workflowFilesSync.workflowFiles !== 'unchanged'
+  ) {
+    const status = result.workflowFilesSync.workflowFiles;
+    if (status === 'pr-exists') {
+      changes.push(`workflow files PR exists (#${result.workflowFilesSync.prNumber})`);
+    } else if (status.startsWith('would-')) {
+      changes.push(`Would sync workflow files`);
+    } else {
+      changes.push(`${wouldPrefix}workflow files (PR #${result.workflowFilesSync.prNumber})`);
+    }
+  }
+
+  // Autolinks changes
+  if (
+    result.autolinksSync?.success &&
+    result.autolinksSync.autolinks &&
+    result.autolinksSync.autolinks !== 'unchanged'
+  ) {
+    const status = result.autolinksSync.autolinks;
+    if (status.startsWith('would-')) {
+      changes.push(`Would sync autolinks`);
+    } else {
+      changes.push(`${wouldPrefix}autolinks`);
+    }
+  }
+
+  // Copilot instructions changes
+  if (
+    result.copilotInstructionsSync?.success &&
+    result.copilotInstructionsSync.copilotInstructions &&
+    result.copilotInstructionsSync.copilotInstructions !== 'unchanged'
+  ) {
+    const status = result.copilotInstructionsSync.copilotInstructions;
+    if (status === 'pr-exists') {
+      changes.push(`copilot-instructions.md PR exists (#${result.copilotInstructionsSync.prNumber})`);
+    } else if (status.startsWith('would-')) {
+      changes.push(`Would sync copilot-instructions.md`);
+    } else {
+      changes.push(`${wouldPrefix}copilot-instructions.md (PR #${result.copilotInstructionsSync.prNumber})`);
+    }
+  }
+
+  // Package.json changes
+  if (
+    result.packageJsonSync?.success &&
+    result.packageJsonSync.packageJson &&
+    result.packageJsonSync.packageJson !== 'unchanged'
+  ) {
+    const status = result.packageJsonSync.packageJson;
+    if (status === 'pr-exists') {
+      changes.push(`package.json PR exists (#${result.packageJsonSync.prNumber})`);
+    } else if (status.startsWith('would-')) {
+      changes.push(`Would sync package.json`);
+    } else {
+      changes.push(`${wouldPrefix}package.json (PR #${result.packageJsonSync.prNumber})`);
+    }
+  }
+
+  return changes;
+}
+
+/**
  * Check if a repository result has any changes
  * @param {Object} result - Repository update result object
- * @returns {boolean} True if there are any changes (settings, topics, code scanning, immutable releases, dependabot, rulesets, pull request template, workflow files, or autolinks)
+ * @returns {boolean} True if there are any changes (settings, topics, code scanning, immutable releases, dependabot, gitignore, rulesets, pull request template, workflow files, autolinks, copilot instructions, or package.json)
  */
 function hasRepositoryChanges(result) {
   return (
@@ -1473,6 +2137,10 @@ function hasRepositoryChanges(result) {
       result.dependabotSync.success &&
       result.dependabotSync.dependabotYml &&
       result.dependabotSync.dependabotYml !== 'unchanged') ||
+    (result.gitignoreSync &&
+      result.gitignoreSync.success &&
+      result.gitignoreSync.gitignore &&
+      result.gitignoreSync.gitignore !== 'unchanged') ||
     (result.rulesetSync &&
       result.rulesetSync.success &&
       result.rulesetSync.ruleset &&
@@ -1488,7 +2156,15 @@ function hasRepositoryChanges(result) {
     (result.autolinksSync &&
       result.autolinksSync.success &&
       result.autolinksSync.autolinks &&
-      result.autolinksSync.autolinks !== 'unchanged')
+      result.autolinksSync.autolinks !== 'unchanged') ||
+    (result.copilotInstructionsSync &&
+      result.copilotInstructionsSync.success &&
+      result.copilotInstructionsSync.copilotInstructions &&
+      result.copilotInstructionsSync.copilotInstructions !== 'unchanged') ||
+    (result.packageJsonSync &&
+      result.packageJsonSync.success &&
+      result.packageJsonSync.packageJson &&
+      result.packageJsonSync.packageJson !== 'unchanged')
   );
 }
 
@@ -1529,7 +2205,11 @@ export async function run() {
 
     // Get dependabot.yml settings
     const dependabotYml = getInput('dependabot-yml');
-    const prTitle = getInput('dependabot-pr-title') || 'chore: update dependabot.yml';
+    const dependabotPrTitle = getInput('dependabot-pr-title') || 'chore: update dependabot.yml';
+
+    // Get .gitignore settings
+    const gitignore = getInput('gitignore');
+    const gitignorePrTitle = getInput('gitignore-pr-title') || 'chore: update .gitignore';
 
     // Get rulesets settings
     const rulesetsFile = getInput('rulesets-file');
@@ -1553,6 +2233,17 @@ export async function run() {
     // Get autolinks settings
     const autolinksFile = getInput('autolinks-file');
 
+    // Get copilot instructions settings
+    const copilotInstructionsMd = getInput('copilot-instructions-md');
+    const copilotInstructionsPrTitle =
+      getInput('copilot-instructions-pr-title') || 'chore: update copilot-instructions.md';
+
+    // Get package.json sync settings
+    const packageJsonFile = getInput('package-json-file');
+    const syncScripts = getBooleanInput('package-json-sync-scripts');
+    const syncEngines = getBooleanInput('package-json-sync-engines');
+    const packageJsonPrTitle = getInput('package-json-pr-title') || 'chore: update package.json';
+
     core.info('Starting Bulk GitHub Repository Settings Action...');
 
     if (dryRun) {
@@ -1570,13 +2261,16 @@ export async function run() {
       immutableReleases !== null ||
       topics !== null ||
       dependabotYml ||
+      gitignore ||
       rulesetsFile ||
       pullRequestTemplate ||
       (workflowFiles && workflowFiles.length > 0) ||
-      autolinksFile;
+      autolinksFile ||
+      copilotInstructionsMd ||
+      (packageJsonFile && (syncScripts || syncEngines));
     if (!hasSettings) {
       throw new Error(
-        'At least one repository setting must be specified (or enable-default-code-scanning must be true, or immutable-releases must be specified, or topics must be provided, or dependabot-yml must be specified, or rulesets-file must be specified, or pull-request-template must be specified, or workflow-files must be specified, or autolinks-file must be specified)'
+        'At least one repository setting must be specified (or enable-default-code-scanning must be true, or immutable-releases must be specified, or topics must be provided, or dependabot-yml must be specified, or gitignore must be specified, or rulesets-file must be specified, or pull-request-template must be specified, or workflow-files must be specified, or autolinks-file must be specified, or copilot-instructions-md must be specified, or package-json-file with package-json-sync-scripts or package-json-sync-engines must be specified)'
       );
     }
 
@@ -1603,6 +2297,9 @@ export async function run() {
     if (dependabotYml) {
       core.info(`Dependabot.yml will be synced from: ${dependabotYml}`);
     }
+    if (gitignore) {
+      core.info(`.gitignore will be synced from: ${gitignore}`);
+    }
     if (rulesetsFile) {
       core.info(`Repository ruleset will be synced from: ${rulesetsFile}`);
     }
@@ -1614,6 +2311,9 @@ export async function run() {
     }
     if (autolinksFile) {
       core.info(`Autolinks will be synced from: ${autolinksFile}`);
+    }
+    if (copilotInstructionsMd) {
+      core.info(`Copilot-instructions.md will be synced from: ${copilotInstructionsMd}`);
     }
 
     // Update repositories
@@ -1681,6 +2381,12 @@ export async function run() {
         repoDependabotYml = repoConfig['dependabot-yml'];
       }
 
+      // Handle repo-specific .gitignore
+      let repoGitignore = gitignore;
+      if (repoConfig['gitignore'] !== undefined) {
+        repoGitignore = repoConfig['gitignore'];
+      }
+
       // Handle repo-specific rulesets-file
       let repoRulesetsFile = rulesetsFile;
       if (repoConfig['rulesets-file'] !== undefined) {
@@ -1714,6 +2420,12 @@ export async function run() {
         repoAutolinksFile = repoConfig['autolinks-file'];
       }
 
+      // Handle repo-specific copilot-instructions-md
+      let repoCopilotInstructionsMd = copilotInstructionsMd;
+      if (repoConfig['copilot-instructions-md'] !== undefined) {
+        repoCopilotInstructionsMd = repoConfig['copilot-instructions-md'];
+      }
+
       const result = await updateRepositorySettings(
         octokit,
         repo,
@@ -1728,7 +2440,7 @@ export async function run() {
       // Sync dependabot.yml if specified
       if (repoDependabotYml) {
         core.info(`  📦 Checking dependabot.yml...`);
-        const dependabotResult = await syncDependabotYml(octokit, repo, repoDependabotYml, prTitle, dryRun);
+        const dependabotResult = await syncDependabotYml(octokit, repo, repoDependabotYml, dependabotPrTitle, dryRun);
 
         // Add dependabot result to the main result
         result.dependabotSync = dependabotResult;
@@ -1740,6 +2452,24 @@ export async function run() {
           }
         } else {
           core.warning(`  ⚠️  ${dependabotResult.error}`);
+        }
+      }
+
+      // Sync .gitignore if specified
+      if (repoGitignore) {
+        core.info(`  📝 Checking .gitignore...`);
+        const gitignoreResult = await syncGitignore(octokit, repo, repoGitignore, gitignorePrTitle, dryRun);
+
+        // Add gitignore result to the main result
+        result.gitignoreSync = gitignoreResult;
+
+        if (gitignoreResult.success) {
+          core.info(`  📝 ${gitignoreResult.message}`);
+          if (gitignoreResult.prUrl) {
+            core.info(`  🔗 PR URL: ${gitignoreResult.prUrl}`);
+          }
+        } else {
+          core.warning(`  ⚠️  ${gitignoreResult.error}`);
         }
       }
 
@@ -1821,12 +2551,82 @@ export async function run() {
         }
       }
 
+      // Sync copilot-instructions.md if specified
+      if (repoCopilotInstructionsMd) {
+        core.info(`  🤖 Checking copilot-instructions.md...`);
+        const copilotResult = await syncCopilotInstructions(
+          octokit,
+          repo,
+          repoCopilotInstructionsMd,
+          copilotInstructionsPrTitle,
+          dryRun
+        );
+
+        // Add copilot instructions result to the main result
+        result.copilotInstructionsSync = copilotResult;
+
+        if (copilotResult.success) {
+          core.info(`  🤖 ${copilotResult.message}`);
+          if (copilotResult.prUrl) {
+            core.info(`  🔗 PR URL: ${copilotResult.prUrl}`);
+          }
+        } else {
+          core.warning(`  ⚠️  ${copilotResult.error}`);
+        }
+      }
+
+      // Sync package.json if specified
+      const repoPackageJsonFile = repoConfig?.['package-json-file'] || packageJsonFile;
+      const repoSyncScripts =
+        repoConfig?.['package-json-sync-scripts'] !== undefined ? repoConfig['package-json-sync-scripts'] : syncScripts;
+      const repoSyncEngines =
+        repoConfig?.['package-json-sync-engines'] !== undefined ? repoConfig['package-json-sync-engines'] : syncEngines;
+
+      if (repoPackageJsonFile && (repoSyncScripts || repoSyncEngines)) {
+        core.info(`  📦 Checking package.json...`);
+        const packageJsonResult = await syncPackageJson(
+          octokit,
+          repo,
+          repoPackageJsonFile,
+          repoSyncScripts,
+          repoSyncEngines,
+          packageJsonPrTitle,
+          dryRun
+        );
+
+        // Add package.json result to the main result
+        result.packageJsonSync = packageJsonResult;
+
+        if (packageJsonResult.success) {
+          core.info(`  📦 ${packageJsonResult.message}`);
+          if (packageJsonResult.prUrl) {
+            core.info(`  🔗 PR URL: ${packageJsonResult.prUrl}`);
+          }
+          if (packageJsonResult.changes && packageJsonResult.changes.length > 0) {
+            for (const change of packageJsonResult.changes) {
+              core.info(`     - ${dryRun ? 'Would update' : 'Updated'} ${change.field}`);
+            }
+          }
+        } else {
+          core.warning(`  ⚠️  ${packageJsonResult.error}`);
+        }
+      }
+
       if (result.success) {
         successCount++;
+        const repoHasChanges = hasRepositoryChanges(result);
         if (dryRun) {
-          core.info(`🔍 Would update ${repo}`);
+          if (repoHasChanges) {
+            core.info(`🔍 Would update ${repo}`);
+          } else {
+            core.info(`✅ No changes needed in ${repo}`);
+          }
         } else {
-          core.info(`✅ Successfully updated ${repo}`);
+          if (repoHasChanges) {
+            core.info(`✅ Successfully updated ${repo}`);
+          } else {
+            core.info(`✅ No changes needed in ${repo}`);
+          }
         }
 
         // Log repository setting changes
@@ -1901,11 +2701,6 @@ export async function run() {
         if (result.immutableReleasesWarning) {
           core.warning(`  ⚠️ ${result.immutableReleasesWarning}`);
         }
-
-        // Log if no changes were needed
-        if (!hasRepositoryChanges(result)) {
-          core.info(`  ℹ️  No changes needed - all settings already match desired state`);
-        }
       } else {
         failureCount++;
         core.warning(`❌ Failed to update ${repo}: ${result.error}`);
@@ -1933,10 +2728,17 @@ export async function run() {
         const hasChanges = hasRepositoryChanges(r);
 
         let details;
-        if (dryRun) {
-          details = hasChanges ? 'Would update' : 'No changes needed';
+        if (hasChanges) {
+          // Get specific list of changes
+          const changesList = getChangesList(r, dryRun);
+          if (changesList.length > 0) {
+            // Format as bullet points for readability
+            details = changesList.join('; ');
+          } else {
+            details = dryRun ? 'Would update' : 'Updated';
+          }
         } else {
-          details = hasChanges ? 'Updated' : 'No changes needed';
+          details = 'No changes needed';
         }
 
         return [r.repository, '✅ Success', details];

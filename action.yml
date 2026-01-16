@@ -56,6 +56,13 @@ inputs:
     description: 'Title for pull requests when updating dependabot.yml'
     required: false
     default: 'chore: update dependabot.yml'
+  gitignore:
+    description: 'Path to a .gitignore file to sync to .gitignore in target repositories (preserves repo-specific content after marker)'
+    required: false
+  gitignore-pr-title:
+    description: 'Title for pull requests when updating .gitignore'
+    required: false
+    default: 'chore: update .gitignore'
   rulesets-file:
     description: 'Path to a JSON file containing repository ruleset configuration to sync to target repositories'
     required: false
@@ -80,6 +87,28 @@ inputs:
   autolinks-file:
     description: 'Path to a JSON file containing autolink references to sync to target repositories'
     required: false
+  copilot-instructions-md:
+    description: 'Path to a copilot-instructions.md file to sync to .github/copilot-instructions.md in target repositories'
+    required: false
+  copilot-instructions-pr-title:
+    description: 'Title for pull requests when updating copilot-instructions.md'
+    required: false
+    default: 'chore: update copilot-instructions.md'
+  package-json-file:
+    description: 'Path to a package.json file to use as source for syncing npm scripts and/or engines'
+    required: false
+  package-json-sync-scripts:
+    description: 'Sync npm scripts from package-json-file to target repositories'
+    required: false
+    default: 'true'
+  package-json-sync-engines:
+    description: 'Sync engines field from package-json-file to target repositories (useful for Node.js version requirements)'
+    required: false
+    default: 'true'
+  package-json-pr-title:
+    description: 'Title for pull requests when updating package.json'
+    required: false
+    default: 'chore: update package.json'
   dry-run:
     description: 'Preview changes without applying them (logs what would be changed)'
     required: false
