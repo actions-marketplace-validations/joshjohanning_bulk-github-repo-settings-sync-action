@@ -108,8 +108,18 @@ inputs:
     description: 'Allow update branch'
   immutable-releases:
     description: 'Immutable releases'
+  code-scanning:
+    description: 'Code scanning'
   enable-default-code-scanning:
-    description: 'Enable default code scanning'
+    description: 'Enable default code scanning (deprecated)'
+  secret-scanning:
+    description: 'Secret scanning'
+  secret-scanning-push-protection:
+    description: 'Secret scanning push protection'
+  dependabot-alerts:
+    description: 'Dependabot alerts'
+  dependabot-security-updates:
+    description: 'Dependabot security updates'
   topics:
     description: 'Topics'
   dependabot-yml:
@@ -165,7 +175,12 @@ const mockActionYmlParsed = {
     'delete-branch-on-merge': { description: 'Delete branch on merge' },
     'allow-update-branch': { description: 'Allow update branch' },
     'immutable-releases': { description: 'Immutable releases' },
-    'enable-default-code-scanning': { description: 'Enable default code scanning' },
+    'code-scanning': { description: 'Code scanning' },
+    'enable-default-code-scanning': { description: 'Enable default code scanning (deprecated)' },
+    'secret-scanning': { description: 'Secret scanning' },
+    'secret-scanning-push-protection': { description: 'Secret scanning push protection' },
+    'dependabot-alerts': { description: 'Dependabot alerts' },
+    'dependabot-security-updates': { description: 'Dependabot security updates' },
     topics: { description: 'Topics' },
     'dependabot-yml': { description: 'Dependabot yml' },
     'dependabot-pr-title': { description: 'Dependabot PR title' },
@@ -316,7 +331,7 @@ describe('Bulk GitHub Repository Settings Action', () => {
         'allow-auto-merge': '',
         'delete-branch-on-merge': '',
         'allow-update-branch': '',
-        'enable-default-code-scanning': '',
+        'code-scanning': '',
         'immutable-releases': '',
         topics: '',
         'dependabot-yml': '',
@@ -465,7 +480,16 @@ describe('Bulk GitHub Repository Settings Action', () => {
         allow_update_branch: true
       };
 
-      const result = await updateRepositorySettings(mockOctokit, 'owner/repo', settings, false, null, null, false);
+      const result = await updateRepositorySettings(
+        mockOctokit,
+        'owner/repo',
+        settings,
+        false,
+        null,
+        null,
+        null,
+        false
+      );
 
       expect(result.success).toBe(true);
       expect(result.repository).toBe('owner/repo');
@@ -495,7 +519,7 @@ describe('Bulk GitHub Repository Settings Action', () => {
 
       const settings = { allow_squash_merge: true };
 
-      const result = await updateRepositorySettings(mockOctokit, 'owner/repo', settings, true, null, null, false);
+      const result = await updateRepositorySettings(mockOctokit, 'owner/repo', settings, true, null, null, null, false);
 
       expect(result.success).toBe(true);
       expect(result.codeScanningEnabled).toBe(true);
@@ -520,7 +544,7 @@ describe('Bulk GitHub Repository Settings Action', () => {
 
       const settings = { allow_squash_merge: true };
 
-      const result = await updateRepositorySettings(mockOctokit, 'owner/repo', settings, true, null, null, false);
+      const result = await updateRepositorySettings(mockOctokit, 'owner/repo', settings, true, null, null, null, false);
 
       expect(result.success).toBe(true);
       expect(result.codeScanningWarning).toContain('Could not process CodeQL');
@@ -543,7 +567,16 @@ describe('Bulk GitHub Repository Settings Action', () => {
       const settings = { allow_squash_merge: true };
       const topics = ['javascript', 'github-actions', 'automation'];
 
-      const result = await updateRepositorySettings(mockOctokit, 'owner/repo', settings, false, null, topics, false);
+      const result = await updateRepositorySettings(
+        mockOctokit,
+        'owner/repo',
+        settings,
+        false,
+        null,
+        topics,
+        null,
+        false
+      );
 
       expect(result.success).toBe(true);
       expect(result.topicsUpdated).toBe(true);
@@ -572,7 +605,16 @@ describe('Bulk GitHub Repository Settings Action', () => {
       const settings = { allow_squash_merge: true };
       const topics = ['test'];
 
-      const result = await updateRepositorySettings(mockOctokit, 'owner/repo', settings, false, null, topics, false);
+      const result = await updateRepositorySettings(
+        mockOctokit,
+        'owner/repo',
+        settings,
+        false,
+        null,
+        topics,
+        null,
+        false
+      );
 
       expect(result.success).toBe(true);
       expect(result.topicsWarning).toContain('Could not process topics');
@@ -589,7 +631,16 @@ describe('Bulk GitHub Repository Settings Action', () => {
 
       const settings = { allow_squash_merge: true };
 
-      const result = await updateRepositorySettings(mockOctokit, 'owner/repo', settings, false, null, null, false);
+      const result = await updateRepositorySettings(
+        mockOctokit,
+        'owner/repo',
+        settings,
+        false,
+        null,
+        null,
+        null,
+        false
+      );
 
       expect(result.success).toBe(true);
       expect(mockOctokit.rest.repos.getAllTopics).not.toHaveBeenCalled();
@@ -611,7 +662,16 @@ describe('Bulk GitHub Repository Settings Action', () => {
 
       const settings = { allow_squash_merge: true };
 
-      const result = await updateRepositorySettings(mockOctokit, 'owner/repo', settings, false, true, null, false);
+      const result = await updateRepositorySettings(
+        mockOctokit,
+        'owner/repo',
+        settings,
+        false,
+        true,
+        null,
+        null,
+        false
+      );
 
       expect(result.success).toBe(true);
       expect(result.immutableReleasesUpdated).toBe(true);
@@ -649,7 +709,16 @@ describe('Bulk GitHub Repository Settings Action', () => {
 
       const settings = { allow_squash_merge: true };
 
-      const result = await updateRepositorySettings(mockOctokit, 'owner/repo', settings, false, false, null, false);
+      const result = await updateRepositorySettings(
+        mockOctokit,
+        'owner/repo',
+        settings,
+        false,
+        false,
+        null,
+        null,
+        false
+      );
 
       expect(result.success).toBe(true);
       expect(result.immutableReleasesUpdated).toBe(true);
@@ -678,7 +747,16 @@ describe('Bulk GitHub Repository Settings Action', () => {
 
       const settings = { allow_squash_merge: true };
 
-      const result = await updateRepositorySettings(mockOctokit, 'owner/repo', settings, false, true, null, false);
+      const result = await updateRepositorySettings(
+        mockOctokit,
+        'owner/repo',
+        settings,
+        false,
+        true,
+        null,
+        null,
+        false
+      );
 
       expect(result.success).toBe(true);
       expect(result.immutableReleasesUnchanged).toBe(true);
@@ -699,7 +777,16 @@ describe('Bulk GitHub Repository Settings Action', () => {
 
       const settings = { allow_squash_merge: true };
 
-      const result = await updateRepositorySettings(mockOctokit, 'owner/repo', settings, false, true, null, false);
+      const result = await updateRepositorySettings(
+        mockOctokit,
+        'owner/repo',
+        settings,
+        false,
+        true,
+        null,
+        null,
+        false
+      );
 
       expect(result.success).toBe(true);
       expect(result.immutableReleasesWarning).toContain('Could not process immutable releases');
@@ -721,7 +808,16 @@ describe('Bulk GitHub Repository Settings Action', () => {
 
       const settings = { allow_squash_merge: true };
 
-      const result = await updateRepositorySettings(mockOctokit, 'owner/repo', settings, false, true, null, false);
+      const result = await updateRepositorySettings(
+        mockOctokit,
+        'owner/repo',
+        settings,
+        false,
+        true,
+        null,
+        null,
+        false
+      );
 
       expect(result.success).toBe(true);
       expect(result.currentImmutableReleases).toBe(false);
@@ -742,10 +838,511 @@ describe('Bulk GitHub Repository Settings Action', () => {
 
       const settings = { allow_squash_merge: true };
 
-      const result = await updateRepositorySettings(mockOctokit, 'owner/repo', settings, false, null, null, false);
+      const result = await updateRepositorySettings(
+        mockOctokit,
+        'owner/repo',
+        settings,
+        false,
+        null,
+        null,
+        null,
+        false
+      );
 
       expect(result.success).toBe(true);
       // request should not be called at all when immutableReleases is null
+      expect(mockOctokit.request).not.toHaveBeenCalled();
+    });
+
+    test('should enable secret scanning when requested', async () => {
+      mockOctokit.rest.repos.get.mockResolvedValue({
+        data: {
+          allow_squash_merge: false,
+          permissions: { admin: true, push: true, pull: true },
+          security_and_analysis: {
+            secret_scanning: { status: 'disabled' }
+          }
+        }
+      });
+      mockOctokit.rest.repos.update.mockResolvedValue({});
+
+      const settings = { allow_squash_merge: true };
+      const securitySettings = {
+        secretScanning: true,
+        secretScanningPushProtection: null,
+        dependabotAlerts: null,
+        dependabotSecurityUpdates: null
+      };
+
+      const result = await updateRepositorySettings(
+        mockOctokit,
+        'owner/repo',
+        settings,
+        false,
+        null,
+        null,
+        securitySettings,
+        false
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.secretScanningUpdated).toBe(true);
+      expect(result.secretScanningChange).toBeDefined();
+      expect(result.secretScanningChange.from).toBe(false);
+      expect(result.secretScanningChange.to).toBe(true);
+      expect(mockOctokit.rest.repos.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          security_and_analysis: {
+            secret_scanning: { status: 'enabled' }
+          }
+        })
+      );
+    });
+
+    test('should handle secret scanning already enabled', async () => {
+      mockOctokit.rest.repos.get.mockResolvedValue({
+        data: {
+          allow_squash_merge: false,
+          permissions: { admin: true, push: true, pull: true },
+          security_and_analysis: {
+            secret_scanning: { status: 'enabled' }
+          }
+        }
+      });
+      mockOctokit.rest.repos.update.mockResolvedValue({});
+
+      const settings = { allow_squash_merge: true };
+      const securitySettings = {
+        secretScanning: true,
+        secretScanningPushProtection: null,
+        dependabotAlerts: null,
+        dependabotSecurityUpdates: null
+      };
+
+      const result = await updateRepositorySettings(
+        mockOctokit,
+        'owner/repo',
+        settings,
+        false,
+        null,
+        null,
+        securitySettings,
+        false
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.secretScanningUnchanged).toBe(true);
+      expect(result.currentSecretScanning).toBe(true);
+    });
+
+    test('should handle secret scanning failures gracefully', async () => {
+      mockOctokit.rest.repos.get.mockResolvedValue({
+        data: {
+          allow_squash_merge: false,
+          permissions: { admin: true, push: true, pull: true },
+          security_and_analysis: {
+            secret_scanning: { status: 'disabled' }
+          }
+        }
+      });
+      mockOctokit.rest.repos.update
+        .mockResolvedValueOnce({}) // First call for settings
+        .mockRejectedValueOnce(new Error('Secret scanning not available')); // Second call for security
+
+      const settings = { allow_squash_merge: true };
+      const securitySettings = {
+        secretScanning: true,
+        secretScanningPushProtection: null,
+        dependabotAlerts: null,
+        dependabotSecurityUpdates: null
+      };
+
+      const result = await updateRepositorySettings(
+        mockOctokit,
+        'owner/repo',
+        settings,
+        false,
+        null,
+        null,
+        securitySettings,
+        false
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.secretScanningWarning).toContain('Could not process secret scanning');
+    });
+
+    test('should enable secret scanning push protection when requested', async () => {
+      mockOctokit.rest.repos.get.mockResolvedValue({
+        data: {
+          allow_squash_merge: false,
+          permissions: { admin: true, push: true, pull: true },
+          security_and_analysis: {
+            secret_scanning: { status: 'enabled' },
+            secret_scanning_push_protection: { status: 'disabled' }
+          }
+        }
+      });
+      mockOctokit.rest.repos.update.mockResolvedValue({});
+
+      const settings = { allow_squash_merge: true };
+      const securitySettings = {
+        secretScanning: null,
+        secretScanningPushProtection: true,
+        dependabotAlerts: null,
+        dependabotSecurityUpdates: null
+      };
+
+      const result = await updateRepositorySettings(
+        mockOctokit,
+        'owner/repo',
+        settings,
+        false,
+        null,
+        null,
+        securitySettings,
+        false
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.secretScanningPushProtectionUpdated).toBe(true);
+      expect(result.secretScanningPushProtectionChange).toBeDefined();
+      expect(result.secretScanningPushProtectionChange.from).toBe(false);
+      expect(result.secretScanningPushProtectionChange.to).toBe(true);
+      expect(mockOctokit.rest.repos.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          security_and_analysis: {
+            secret_scanning_push_protection: { status: 'enabled' }
+          }
+        })
+      );
+    });
+
+    test('should handle secret scanning push protection already enabled', async () => {
+      mockOctokit.rest.repos.get.mockResolvedValue({
+        data: {
+          allow_squash_merge: false,
+          permissions: { admin: true, push: true, pull: true },
+          security_and_analysis: {
+            secret_scanning: { status: 'enabled' },
+            secret_scanning_push_protection: { status: 'enabled' }
+          }
+        }
+      });
+      mockOctokit.rest.repos.update.mockResolvedValue({});
+
+      const settings = { allow_squash_merge: true };
+      const securitySettings = {
+        secretScanning: null,
+        secretScanningPushProtection: true,
+        dependabotAlerts: null,
+        dependabotSecurityUpdates: null
+      };
+
+      const result = await updateRepositorySettings(
+        mockOctokit,
+        'owner/repo',
+        settings,
+        false,
+        null,
+        null,
+        securitySettings,
+        false
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.secretScanningPushProtectionUnchanged).toBe(true);
+      expect(result.currentSecretScanningPushProtection).toBe(true);
+    });
+
+    test('should disable secret scanning push protection when requested', async () => {
+      mockOctokit.rest.repos.get.mockResolvedValue({
+        data: {
+          allow_squash_merge: false,
+          permissions: { admin: true, push: true, pull: true },
+          security_and_analysis: {
+            secret_scanning: { status: 'enabled' },
+            secret_scanning_push_protection: { status: 'enabled' }
+          }
+        }
+      });
+      mockOctokit.rest.repos.update.mockResolvedValue({});
+
+      const settings = { allow_squash_merge: true };
+      const securitySettings = {
+        secretScanning: null,
+        secretScanningPushProtection: false,
+        dependabotAlerts: null,
+        dependabotSecurityUpdates: null
+      };
+
+      const result = await updateRepositorySettings(
+        mockOctokit,
+        'owner/repo',
+        settings,
+        false,
+        null,
+        null,
+        securitySettings,
+        false
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.secretScanningPushProtectionUpdated).toBe(true);
+      expect(result.secretScanningPushProtectionChange).toBeDefined();
+      expect(result.secretScanningPushProtectionChange.from).toBe(true);
+      expect(result.secretScanningPushProtectionChange.to).toBe(false);
+      expect(mockOctokit.rest.repos.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          security_and_analysis: {
+            secret_scanning_push_protection: { status: 'disabled' }
+          }
+        })
+      );
+    });
+
+    test('should enable Dependabot alerts when requested', async () => {
+      mockOctokit.rest.repos.get.mockResolvedValue({
+        data: {
+          allow_squash_merge: false,
+          permissions: { admin: true, push: true, pull: true }
+        }
+      });
+      mockOctokit.rest.repos.update.mockResolvedValue({});
+      // Mock GET to return 404 (disabled)
+      mockOctokit.request.mockRejectedValueOnce({ status: 404 });
+      // Mock PUT to enable
+      mockOctokit.request.mockResolvedValueOnce({});
+
+      const settings = { allow_squash_merge: true };
+      const securitySettings = {
+        secretScanning: null,
+        secretScanningPushProtection: null,
+        dependabotAlerts: true,
+        dependabotSecurityUpdates: null
+      };
+
+      const result = await updateRepositorySettings(
+        mockOctokit,
+        'owner/repo',
+        settings,
+        false,
+        null,
+        null,
+        securitySettings,
+        false
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.dependabotAlertsUpdated).toBe(true);
+      expect(result.dependabotAlertsChange).toBeDefined();
+      expect(result.dependabotAlertsChange.from).toBe(false);
+      expect(result.dependabotAlertsChange.to).toBe(true);
+      expect(mockOctokit.request).toHaveBeenCalledWith(
+        'PUT /repos/{owner}/{repo}/vulnerability-alerts',
+        expect.objectContaining({
+          owner: 'owner',
+          repo: 'repo'
+        })
+      );
+    });
+
+    test('should disable Dependabot alerts when requested', async () => {
+      mockOctokit.rest.repos.get.mockResolvedValue({
+        data: {
+          allow_squash_merge: false,
+          permissions: { admin: true, push: true, pull: true }
+        }
+      });
+      mockOctokit.rest.repos.update.mockResolvedValue({});
+      // Mock GET to return 204 (enabled)
+      mockOctokit.request.mockResolvedValueOnce({});
+      // Mock DELETE to disable
+      mockOctokit.request.mockResolvedValueOnce({});
+
+      const settings = { allow_squash_merge: true };
+      const securitySettings = {
+        secretScanning: null,
+        secretScanningPushProtection: null,
+        dependabotAlerts: false,
+        dependabotSecurityUpdates: null
+      };
+
+      const result = await updateRepositorySettings(
+        mockOctokit,
+        'owner/repo',
+        settings,
+        false,
+        null,
+        null,
+        securitySettings,
+        false
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.dependabotAlertsUpdated).toBe(true);
+      expect(result.dependabotAlertsChange.from).toBe(true);
+      expect(result.dependabotAlertsChange.to).toBe(false);
+      expect(mockOctokit.request).toHaveBeenCalledWith(
+        'DELETE /repos/{owner}/{repo}/vulnerability-alerts',
+        expect.objectContaining({
+          owner: 'owner',
+          repo: 'repo'
+        })
+      );
+    });
+
+    test('should handle Dependabot alerts already in desired state', async () => {
+      mockOctokit.rest.repos.get.mockResolvedValue({
+        data: {
+          allow_squash_merge: false,
+          permissions: { admin: true, push: true, pull: true }
+        }
+      });
+      mockOctokit.rest.repos.update.mockResolvedValue({});
+      // Mock GET to return 204 (enabled)
+      mockOctokit.request.mockResolvedValueOnce({});
+
+      const settings = { allow_squash_merge: true };
+      const securitySettings = {
+        secretScanning: null,
+        secretScanningPushProtection: null,
+        dependabotAlerts: true,
+        dependabotSecurityUpdates: null
+      };
+
+      const result = await updateRepositorySettings(
+        mockOctokit,
+        'owner/repo',
+        settings,
+        false,
+        null,
+        null,
+        securitySettings,
+        false
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.dependabotAlertsUnchanged).toBe(true);
+      expect(result.currentDependabotAlerts).toBe(true);
+    });
+
+    test('should handle Dependabot security updates enable', async () => {
+      mockOctokit.rest.repos.get.mockResolvedValue({
+        data: {
+          allow_squash_merge: false,
+          permissions: { admin: true, push: true, pull: true }
+        }
+      });
+      mockOctokit.rest.repos.update.mockResolvedValue({});
+      // Mock GET to return disabled
+      mockOctokit.request.mockResolvedValueOnce({ data: { enabled: false } });
+      // Mock PUT to enable
+      mockOctokit.request.mockResolvedValueOnce({});
+
+      const settings = { allow_squash_merge: true };
+      const securitySettings = {
+        secretScanning: null,
+        secretScanningPushProtection: null,
+        dependabotAlerts: null,
+        dependabotSecurityUpdates: true
+      };
+
+      const result = await updateRepositorySettings(
+        mockOctokit,
+        'owner/repo',
+        settings,
+        false,
+        null,
+        null,
+        securitySettings,
+        false
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.dependabotSecurityUpdatesUpdated).toBe(true);
+      expect(result.dependabotSecurityUpdatesChange).toBeDefined();
+      expect(result.dependabotSecurityUpdatesChange.from).toBe(false);
+      expect(result.dependabotSecurityUpdatesChange.to).toBe(true);
+    });
+
+    test('should handle security settings in dry-run mode', async () => {
+      mockOctokit.rest.repos.get.mockResolvedValue({
+        data: {
+          allow_squash_merge: false,
+          permissions: { admin: true, push: true, pull: true },
+          security_and_analysis: {
+            secret_scanning: { status: 'disabled' }
+          }
+        }
+      });
+      mockOctokit.rest.repos.update.mockResolvedValue({});
+      // Mock GET for Dependabot alerts to return 404 (disabled)
+      mockOctokit.request.mockRejectedValueOnce({ status: 404 });
+      // Mock GET for Dependabot security updates to return disabled
+      mockOctokit.request.mockResolvedValueOnce({ data: { enabled: false } });
+
+      const settings = { allow_squash_merge: true };
+      const securitySettings = {
+        secretScanning: true,
+        secretScanningPushProtection: null,
+        dependabotAlerts: true,
+        dependabotSecurityUpdates: true
+      };
+
+      const result = await updateRepositorySettings(
+        mockOctokit,
+        'owner/repo',
+        settings,
+        false,
+        null,
+        null,
+        securitySettings,
+        true // dry-run
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.dryRun).toBe(true);
+      expect(result.secretScanningWouldUpdate).toBe(true);
+      expect(result.dependabotAlertsWouldUpdate).toBe(true);
+      expect(result.dependabotSecurityUpdatesWouldUpdate).toBe(true);
+      // Should not call PUT/DELETE in dry-run mode (only GETs for checking status)
+      expect(mockOctokit.request).not.toHaveBeenCalledWith(
+        'PUT /repos/{owner}/{repo}/vulnerability-alerts',
+        expect.anything()
+      );
+    });
+
+    test('should not check security settings when all are null', async () => {
+      mockOctokit.rest.repos.get.mockResolvedValue({
+        data: {
+          allow_squash_merge: false,
+          permissions: { admin: true, push: true, pull: true }
+        }
+      });
+      mockOctokit.rest.repos.update.mockResolvedValue({});
+
+      const settings = { allow_squash_merge: true };
+      const securitySettings = {
+        secretScanning: null,
+        secretScanningPushProtection: null,
+        dependabotAlerts: null,
+        dependabotSecurityUpdates: null
+      };
+
+      const result = await updateRepositorySettings(
+        mockOctokit,
+        'owner/repo',
+        settings,
+        false,
+        null,
+        null,
+        securitySettings,
+        false
+      );
+
+      expect(result.success).toBe(true);
+      // Should not call request for security settings when all are null
       expect(mockOctokit.request).not.toHaveBeenCalled();
     });
 
@@ -772,7 +1369,7 @@ describe('Bulk GitHub Repository Settings Action', () => {
         allow_update_branch: null
       };
 
-      await updateRepositorySettings(mockOctokit, 'owner/repo', settings, false, null, null, false);
+      await updateRepositorySettings(mockOctokit, 'owner/repo', settings, false, null, null, null, false);
 
       expect(mockOctokit.rest.repos.update).toHaveBeenCalledWith({
         owner: 'owner',
@@ -784,7 +1381,16 @@ describe('Bulk GitHub Repository Settings Action', () => {
 
     test('should handle invalid repository format', async () => {
       const settings = { allow_squash_merge: true };
-      const result = await updateRepositorySettings(mockOctokit, 'invalid-repo', settings, false, null, null, false);
+      const result = await updateRepositorySettings(
+        mockOctokit,
+        'invalid-repo',
+        settings,
+        false,
+        null,
+        null,
+        null,
+        false
+      );
 
       expect(result.success).toBe(false);
       expect(result.error).toBe('Invalid repository format. Expected "owner/repo"');
@@ -794,7 +1400,16 @@ describe('Bulk GitHub Repository Settings Action', () => {
       mockOctokit.rest.repos.get.mockRejectedValue(new Error('API Error'));
 
       const settings = { allow_squash_merge: true };
-      const result = await updateRepositorySettings(mockOctokit, 'owner/repo', settings, false, null, null, false);
+      const result = await updateRepositorySettings(
+        mockOctokit,
+        'owner/repo',
+        settings,
+        false,
+        null,
+        null,
+        null,
+        false
+      );
 
       expect(result.success).toBe(false);
       expect(result.error).toBe('API Error');
@@ -806,7 +1421,16 @@ describe('Bulk GitHub Repository Settings Action', () => {
       mockOctokit.rest.repos.get.mockRejectedValue(error403);
 
       const settings = { allow_squash_merge: true };
-      const result = await updateRepositorySettings(mockOctokit, 'owner/repo', settings, false, null, null, false);
+      const result = await updateRepositorySettings(
+        mockOctokit,
+        'owner/repo',
+        settings,
+        false,
+        null,
+        null,
+        null,
+        false
+      );
 
       expect(result.success).toBe(false);
       expect(result.accessDenied).toBe(true);
@@ -825,7 +1449,16 @@ describe('Bulk GitHub Repository Settings Action', () => {
       });
 
       const settings = { allow_squash_merge: false };
-      const result = await updateRepositorySettings(mockOctokit, 'owner/repo', settings, false, null, null, false);
+      const result = await updateRepositorySettings(
+        mockOctokit,
+        'owner/repo',
+        settings,
+        false,
+        null,
+        null,
+        null,
+        false
+      );
 
       expect(result.success).toBe(false);
       expect(result.insufficientPermissions).toBe(true);
@@ -852,7 +1485,16 @@ describe('Bulk GitHub Repository Settings Action', () => {
       });
 
       const settings = { allow_squash_merge: false };
-      const result = await updateRepositorySettings(mockOctokit, 'owner/repo', settings, false, null, null, false);
+      const result = await updateRepositorySettings(
+        mockOctokit,
+        'owner/repo',
+        settings,
+        false,
+        null,
+        null,
+        null,
+        false
+      );
 
       expect(result.success).toBe(false);
       expect(result.insufficientPermissions).toBe(true);
@@ -877,7 +1519,16 @@ describe('Bulk GitHub Repository Settings Action', () => {
       });
 
       const settings = { allow_squash_merge: false };
-      const result = await updateRepositorySettings(mockOctokit, 'owner/repo', settings, false, null, null, false);
+      const result = await updateRepositorySettings(
+        mockOctokit,
+        'owner/repo',
+        settings,
+        false,
+        null,
+        null,
+        null,
+        false
+      );
 
       expect(result.success).toBe(true);
       expect(result.changes).toHaveLength(1);
@@ -899,7 +1550,7 @@ describe('Bulk GitHub Repository Settings Action', () => {
       });
 
       const settings = { allow_squash_merge: true };
-      const result = await updateRepositorySettings(mockOctokit, 'owner/repo', settings, false, null, null, true); // dry-run
+      const result = await updateRepositorySettings(mockOctokit, 'owner/repo', settings, false, null, null, null, true); // dry-run
 
       expect(result.success).toBe(true);
       expect(result.dryRun).toBe(true);
@@ -931,7 +1582,16 @@ describe('Bulk GitHub Repository Settings Action', () => {
       const settings = { allow_squash_merge: true };
       const topics = ['javascript', 'test'];
 
-      const result = await updateRepositorySettings(mockOctokit, 'owner/repo', settings, true, true, topics, true);
+      const result = await updateRepositorySettings(
+        mockOctokit,
+        'owner/repo',
+        settings,
+        true,
+        true,
+        topics,
+        null,
+        true
+      );
 
       expect(result.success).toBe(true);
       expect(result.dryRun).toBe(true);
@@ -1023,7 +1683,7 @@ describe('Bulk GitHub Repository Settings Action', () => {
       await run();
 
       expect(mockCore.setFailed).toHaveBeenCalledWith(
-        'Action failed with error: At least one repository setting must be specified (or enable-default-code-scanning must be true, or immutable-releases must be specified, or topics must be provided, or dependabot-yml must be specified, or gitignore must be specified, or rulesets-file must be specified, or pull-request-template must be specified, or workflow-files must be specified, or autolinks-file must be specified, or copilot-instructions-md must be specified, or package-json-file with package-json-sync-scripts or package-json-sync-engines must be specified)'
+        'Action failed with error: At least one repository setting must be specified (or code-scanning must be true, or immutable-releases must be specified, or security settings must be specified, or topics must be provided, or dependabot-yml must be specified, or gitignore must be specified, or rulesets-file must be specified, or pull-request-template must be specified, or workflow-files must be specified, or autolinks-file must be specified, or copilot-instructions-md must be specified, or package-json-file with package-json-sync-scripts or package-json-sync-engines must be specified)'
       );
     });
 
@@ -1056,7 +1716,7 @@ describe('Bulk GitHub Repository Settings Action', () => {
         const inputs = {
           'github-token': 'test-token',
           repositories: 'owner/repo1',
-          'enable-default-code-scanning': 'true'
+          'code-scanning': 'true'
         };
         return inputs[name] || '';
       });
@@ -1074,6 +1734,97 @@ describe('Bulk GitHub Repository Settings Action', () => {
         state: 'configured',
         query_suite: 'default'
       });
+    });
+
+    test('should allow code-scanning false as a valid setting (no API call made)', async () => {
+      mockCore.getInput.mockImplementation(name => {
+        const inputs = {
+          'github-token': 'test-token',
+          repositories: 'owner/repo1',
+          'code-scanning': 'false'
+        };
+        return inputs[name] || '';
+      });
+
+      mockOctokit.rest.repos.update.mockResolvedValue({});
+
+      await run();
+
+      // code-scanning: false is a valid setting (doesn't fail with "no settings specified")
+      expect(mockCore.setOutput).toHaveBeenCalledWith('updated-repositories', '1');
+      expect(mockCore.setOutput).toHaveBeenCalledWith('failed-repositories', '0');
+      // But the current implementation only supports enabling, so no API call is made
+      expect(mockOctokit.rest.codeScanning.updateDefaultSetup).not.toHaveBeenCalled();
+    });
+
+    test('should show deprecation warning when using old enable-default-code-scanning input', async () => {
+      mockCore.getInput.mockImplementation(name => {
+        const inputs = {
+          'github-token': 'test-token',
+          repositories: 'owner/repo1',
+          'enable-default-code-scanning': 'true'
+        };
+        return inputs[name] || '';
+      });
+
+      mockOctokit.rest.repos.update.mockResolvedValue({});
+      mockOctokit.rest.codeScanning.updateDefaultSetup.mockResolvedValue({});
+
+      await run();
+
+      expect(mockCore.warning).toHaveBeenCalledWith(
+        'The "enable-default-code-scanning" input is deprecated. Please use "code-scanning" instead.'
+      );
+      expect(mockOctokit.rest.codeScanning.updateDefaultSetup).toHaveBeenCalledWith({
+        owner: 'owner',
+        repo: 'repo1',
+        state: 'configured',
+        query_suite: 'default'
+      });
+    });
+
+    test('should show deprecation warning when both old and new code-scanning inputs are provided', async () => {
+      mockCore.getInput.mockImplementation(name => {
+        const inputs = {
+          'github-token': 'test-token',
+          repositories: 'owner/repo1',
+          'code-scanning': 'false',
+          'enable-default-code-scanning': 'true'
+        };
+        return inputs[name] || '';
+      });
+
+      mockOctokit.rest.repos.update.mockResolvedValue({});
+
+      await run();
+
+      // Should warn about deprecated input
+      expect(mockCore.warning).toHaveBeenCalledWith(
+        'The "enable-default-code-scanning" input is deprecated. Please use "code-scanning" instead.'
+      );
+      // New input takes precedence (false means no action, only true enables)
+      expect(mockOctokit.rest.codeScanning.updateDefaultSetup).not.toHaveBeenCalled();
+    });
+
+    test('should not show deprecation warning when only new code-scanning input is used', async () => {
+      mockCore.getInput.mockImplementation(name => {
+        const inputs = {
+          'github-token': 'test-token',
+          repositories: 'owner/repo1',
+          'code-scanning': 'true'
+        };
+        return inputs[name] || '';
+      });
+
+      mockOctokit.rest.repos.update.mockResolvedValue({});
+      mockOctokit.rest.codeScanning.updateDefaultSetup.mockResolvedValue({});
+
+      await run();
+
+      // Should not warn about deprecated input
+      expect(mockCore.warning).not.toHaveBeenCalledWith(
+        'The "enable-default-code-scanning" input is deprecated. Please use "code-scanning" instead.'
+      );
     });
 
     test('should allow immutable releases as the only setting', async () => {
@@ -1200,7 +1951,7 @@ describe('Bulk GitHub Repository Settings Action', () => {
         const inputs = {
           'github-token': 'test-token',
           repositories: 'owner/repo1',
-          'enable-default-code-scanning': 'true'
+          'code-scanning': 'true'
         };
         return inputs[name] || '';
       });
@@ -2199,7 +2950,7 @@ describe('Bulk GitHub Repository Settings Action', () => {
       expect(mockOctokit.rest.pulls.create).toHaveBeenCalled();
     });
 
-    test('should report existing open PR when one exists', async () => {
+    test('should update existing PR when content differs', async () => {
       const newContent =
         'version: 2\nupdates:\n  - package-ecosystem: "npm"\n    directory: "/"\n    schedule:\n      interval: "daily"';
       const oldContent =
@@ -2213,12 +2964,87 @@ describe('Bulk GitHub Repository Settings Action', () => {
         }
       });
 
-      mockOctokit.rest.repos.getContent.mockResolvedValue({
+      // First call: check default branch (for initial comparison)
+      // Second call: check PR branch (for PR update comparison)
+      mockOctokit.rest.repos.getContent
+        .mockResolvedValueOnce({
+          data: {
+            sha: 'file-sha-default',
+            content: Buffer.from(oldContent).toString('base64')
+          }
+        })
+        .mockResolvedValueOnce({
+          data: {
+            sha: 'file-sha-pr-branch',
+            content: Buffer.from(oldContent).toString('base64')
+          }
+        });
+
+      // Existing PR found
+      mockOctokit.rest.pulls.list.mockResolvedValue({
+        data: [
+          {
+            number: 50,
+            html_url: 'https://github.com/owner/repo/pull/50'
+          }
+        ]
+      });
+
+      mockOctokit.rest.repos.createOrUpdateFileContents.mockResolvedValue({
+        data: { commit: { sha: 'new-commit-sha' } }
+      });
+
+      const result = await syncDependabotYml(
+        mockOctokit,
+        'owner/repo',
+        './dependabot.yml',
+        'chore: update dependabot.yml',
+        false
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.dependabotYml).toBe('pr-updated');
+      expect(result.prNumber).toBe(50);
+      expect(result.prUrl).toBe('https://github.com/owner/repo/pull/50');
+      expect(result.message).toContain('Updated');
+      expect(result.message).toContain('PR #50');
+      expect(mockOctokit.rest.repos.createOrUpdateFileContents).toHaveBeenCalledWith(
+        expect.objectContaining({
+          branch: 'dependabot-yml-sync',
+          sha: 'file-sha-pr-branch'
+        })
+      );
+      expect(mockOctokit.rest.pulls.create).not.toHaveBeenCalled();
+    });
+
+    test('should report pr-up-to-date when PR exists with same content', async () => {
+      const newContent =
+        'version: 2\nupdates:\n  - package-ecosystem: "npm"\n    directory: "/"\n    schedule:\n      interval: "daily"';
+      const oldContent =
+        'version: 2\nupdates:\n  - package-ecosystem: "npm"\n    directory: "/"\n    schedule:\n      interval: "weekly"';
+
+      setMockFileContent(newContent);
+
+      mockOctokit.rest.repos.get.mockResolvedValue({
         data: {
-          sha: 'file-sha-999',
-          content: Buffer.from(oldContent).toString('base64')
+          default_branch: 'main'
         }
       });
+
+      // Default branch has old content, but PR branch already has the new content
+      mockOctokit.rest.repos.getContent
+        .mockResolvedValueOnce({
+          data: {
+            sha: 'file-sha-default',
+            content: Buffer.from(oldContent).toString('base64')
+          }
+        })
+        .mockResolvedValueOnce({
+          data: {
+            sha: 'file-sha-pr-branch',
+            content: Buffer.from(newContent).toString('base64')
+          }
+        });
 
       // Existing PR found
       mockOctokit.rest.pulls.list.mockResolvedValue({
@@ -2239,14 +3065,118 @@ describe('Bulk GitHub Repository Settings Action', () => {
       );
 
       expect(result.success).toBe(true);
-      expect(result.dependabotYml).toBe('pr-exists');
+      expect(result.dependabotYml).toBe('pr-up-to-date');
       expect(result.prNumber).toBe(50);
       expect(result.prUrl).toBe('https://github.com/owner/repo/pull/50');
-      expect(mockOctokit.rest.git.createRef).not.toHaveBeenCalled();
-      expect(mockOctokit.rest.git.updateRef).not.toHaveBeenCalled();
+      expect(result.message).toContain('PR #50 already has the latest');
       expect(mockOctokit.rest.repos.createOrUpdateFileContents).not.toHaveBeenCalled();
       expect(mockOctokit.rest.pulls.create).not.toHaveBeenCalled();
-      expect(mockOctokit.rest.pulls.update).not.toHaveBeenCalled();
+    });
+
+    test('should create file in PR branch when file does not exist in PR branch', async () => {
+      const newContent = 'version: 2\nupdates:\n  - package-ecosystem: "npm"';
+
+      setMockFileContent(newContent);
+
+      mockOctokit.rest.repos.get.mockResolvedValue({
+        data: {
+          default_branch: 'main'
+        }
+      });
+
+      // First call: file doesn't exist in default branch
+      // Second call: file doesn't exist in PR branch either
+      mockOctokit.rest.repos.getContent.mockRejectedValueOnce({ status: 404 }).mockRejectedValueOnce({ status: 404 });
+
+      // Existing PR found
+      mockOctokit.rest.pulls.list.mockResolvedValue({
+        data: [
+          {
+            number: 50,
+            html_url: 'https://github.com/owner/repo/pull/50'
+          }
+        ]
+      });
+
+      mockOctokit.rest.repos.createOrUpdateFileContents.mockResolvedValue({
+        data: { commit: { sha: 'new-commit-sha' } }
+      });
+
+      const result = await syncDependabotYml(
+        mockOctokit,
+        'owner/repo',
+        './dependabot.yml',
+        'chore: add dependabot.yml',
+        false
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.dependabotYml).toBe('pr-updated-created');
+      expect(result.prNumber).toBe(50);
+      expect(result.message).toContain('Created');
+      expect(result.message).toContain('PR #50');
+      expect(mockOctokit.rest.repos.createOrUpdateFileContents).toHaveBeenCalledWith(
+        expect.objectContaining({
+          branch: 'dependabot-yml-sync',
+          sha: undefined
+        })
+      );
+      expect(mockOctokit.rest.pulls.create).not.toHaveBeenCalled();
+    });
+
+    test('should handle dry-run mode with existing PR needing update', async () => {
+      const newContent = 'version: 2\nupdates:\n  - package-ecosystem: "npm"\n    schedule:\n      interval: "daily"';
+      const oldContent = 'version: 2\nupdates:\n  - package-ecosystem: "npm"\n    schedule:\n      interval: "weekly"';
+
+      setMockFileContent(newContent);
+
+      mockOctokit.rest.repos.get.mockResolvedValue({
+        data: {
+          default_branch: 'main'
+        }
+      });
+
+      mockOctokit.rest.repos.getContent
+        .mockResolvedValueOnce({
+          data: {
+            sha: 'file-sha-default',
+            content: Buffer.from(oldContent).toString('base64')
+          }
+        })
+        .mockResolvedValueOnce({
+          data: {
+            sha: 'file-sha-pr-branch',
+            content: Buffer.from(oldContent).toString('base64')
+          }
+        });
+
+      // Existing PR found
+      mockOctokit.rest.pulls.list.mockResolvedValue({
+        data: [
+          {
+            number: 50,
+            html_url: 'https://github.com/owner/repo/pull/50'
+          }
+        ]
+      });
+
+      const result = await syncDependabotYml(
+        mockOctokit,
+        'owner/repo',
+        './dependabot.yml',
+        'chore: update dependabot.yml',
+        true // dry-run
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.dependabotYml).toBe('would-update-pr');
+      expect(result.prNumber).toBe(50);
+      expect(result.prUrl).toBe('https://github.com/owner/repo/pull/50');
+      expect(result.dryRun).toBe(true);
+      expect(result.message).toContain('Would update');
+      expect(result.message).toContain('PR #50');
+      expect(mockOctokit.rest.repos.createOrUpdateFileContents).not.toHaveBeenCalled();
+      expect(mockOctokit.rest.pulls.create).not.toHaveBeenCalled();
     });
 
     test('should handle dry-run mode', async () => {
@@ -3192,7 +4122,7 @@ describe('Bulk GitHub Repository Settings Action', () => {
       expect(mockOctokit.rest.pulls.create).toHaveBeenCalled();
     });
 
-    test('should report existing open PR when one exists', async () => {
+    test('should update existing PR when content differs', async () => {
       const newContent = '## Description\n\nNew content';
       const oldContent = '## Description\n\nOld content';
 
@@ -3204,12 +4134,82 @@ describe('Bulk GitHub Repository Settings Action', () => {
         }
       });
 
-      mockOctokit.rest.repos.getContent.mockResolvedValue({
+      // First call: check default branch, second call: check PR branch
+      mockOctokit.rest.repos.getContent
+        .mockResolvedValueOnce({
+          data: {
+            sha: 'file-sha-default',
+            content: Buffer.from(oldContent).toString('base64')
+          }
+        })
+        .mockResolvedValueOnce({
+          data: {
+            sha: 'file-sha-pr-branch',
+            content: Buffer.from(oldContent).toString('base64')
+          }
+        });
+
+      // Existing PR found
+      mockOctokit.rest.pulls.list.mockResolvedValue({
+        data: [
+          {
+            number: 50,
+            html_url: 'https://github.com/owner/repo/pull/50'
+          }
+        ]
+      });
+
+      mockOctokit.rest.repos.createOrUpdateFileContents.mockResolvedValue({
+        data: { commit: { sha: 'new-commit-sha' } }
+      });
+
+      const result = await syncPullRequestTemplate(
+        mockOctokit,
+        'owner/repo',
+        './pull_request_template.md',
+        'chore: update pull request template',
+        false
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.pullRequestTemplate).toBe('pr-updated');
+      expect(result.prNumber).toBe(50);
+      expect(result.prUrl).toBe('https://github.com/owner/repo/pull/50');
+      expect(mockOctokit.rest.repos.createOrUpdateFileContents).toHaveBeenCalledWith(
+        expect.objectContaining({
+          branch: 'pull-request-template-sync',
+          sha: 'file-sha-pr-branch'
+        })
+      );
+      expect(mockOctokit.rest.pulls.create).not.toHaveBeenCalled();
+    });
+
+    test('should report pr-up-to-date when PR exists with same content', async () => {
+      const content = '## Description\n\nSame content';
+      const oldContent = '## Description\n\nOld content';
+
+      setMockFileContent(content);
+
+      mockOctokit.rest.repos.get.mockResolvedValue({
         data: {
-          sha: 'file-sha-999',
-          content: Buffer.from(oldContent).toString('base64')
+          default_branch: 'main'
         }
       });
+
+      // Default branch has old content, but PR branch already has the new content
+      mockOctokit.rest.repos.getContent
+        .mockResolvedValueOnce({
+          data: {
+            sha: 'file-sha-default',
+            content: Buffer.from(oldContent).toString('base64')
+          }
+        })
+        .mockResolvedValueOnce({
+          data: {
+            sha: 'file-sha-pr-branch',
+            content: Buffer.from(content).toString('base64')
+          }
+        });
 
       // Existing PR found
       mockOctokit.rest.pulls.list.mockResolvedValue({
@@ -3230,14 +4230,12 @@ describe('Bulk GitHub Repository Settings Action', () => {
       );
 
       expect(result.success).toBe(true);
-      expect(result.pullRequestTemplate).toBe('pr-exists');
+      expect(result.pullRequestTemplate).toBe('pr-up-to-date');
       expect(result.prNumber).toBe(50);
       expect(result.prUrl).toBe('https://github.com/owner/repo/pull/50');
-      expect(mockOctokit.rest.git.createRef).not.toHaveBeenCalled();
-      expect(mockOctokit.rest.git.updateRef).not.toHaveBeenCalled();
+      expect(result.message).toContain('PR #50 already has the latest');
       expect(mockOctokit.rest.repos.createOrUpdateFileContents).not.toHaveBeenCalled();
       expect(mockOctokit.rest.pulls.create).not.toHaveBeenCalled();
-      expect(mockOctokit.rest.pulls.update).not.toHaveBeenCalled();
     });
 
     test('should handle dry-run mode', async () => {
@@ -3592,7 +4590,7 @@ describe('Bulk GitHub Repository Settings Action', () => {
       });
     });
 
-    test('should report existing open PR when one exists', async () => {
+    test('should update existing PR when content differs', async () => {
       const newContent = 'name: CI\non: [push, pull_request]';
       const oldContent = 'name: CI\non: [push]';
 
@@ -3602,12 +4600,144 @@ describe('Bulk GitHub Repository Settings Action', () => {
         data: { default_branch: 'main' }
       });
 
-      mockOctokit.rest.repos.getContent.mockResolvedValue({
-        data: {
-          sha: 'file-sha-999',
-          content: Buffer.from(oldContent).toString('base64')
-        }
+      // First call: check default branch, second call: check PR branch
+      mockOctokit.rest.repos.getContent
+        .mockResolvedValueOnce({
+          data: {
+            sha: 'file-sha-default',
+            content: Buffer.from(oldContent).toString('base64')
+          }
+        })
+        .mockResolvedValueOnce({
+          data: {
+            sha: 'file-sha-pr-branch',
+            content: Buffer.from(oldContent).toString('base64')
+          }
+        });
+
+      // Existing PR found
+      mockOctokit.rest.pulls.list.mockResolvedValue({
+        data: [
+          {
+            number: 50,
+            html_url: 'https://github.com/owner/repo/pull/50'
+          }
+        ]
       });
+
+      mockOctokit.rest.repos.createOrUpdateFileContents.mockResolvedValue({
+        data: { commit: { sha: 'new-commit-sha' } }
+      });
+
+      const result = await syncWorkflowFiles(
+        mockOctokit,
+        'owner/repo',
+        ['./workflows/ci.yml'],
+        'chore: update workflow files',
+        false
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.workflowFiles).toBe('pr-updated');
+      expect(result.prNumber).toBe(50);
+      expect(result.prUrl).toBe('https://github.com/owner/repo/pull/50');
+      expect(mockOctokit.rest.repos.createOrUpdateFileContents).toHaveBeenCalledWith(
+        expect.objectContaining({
+          branch: 'workflow-files-sync',
+          sha: 'file-sha-pr-branch'
+        })
+      );
+      expect(mockOctokit.rest.pulls.create).not.toHaveBeenCalled();
+    });
+
+    test('should return pr-updated-mixed when existing PR has files created and updated', async () => {
+      const ciContent = 'name: CI\non: [push, pull_request]';
+      const releaseContent = 'name: Release\non: [release]';
+      const oldCiContent = 'name: CI\non: [push]';
+
+      mockFs.readFileSync.mockImplementation(path => {
+        if (path.includes('ci.yml')) return ciContent;
+        if (path.includes('release.yml')) return releaseContent;
+        throw new Error('Unknown file');
+      });
+
+      mockOctokit.rest.repos.get.mockResolvedValue({
+        data: { default_branch: 'main' }
+      });
+
+      // Mock getContent for default branch check and PR branch check
+      // Default branch: ci.yml exists with old content, release.yml doesn't exist
+      // PR branch: ci.yml exists with old content (needs update), release.yml doesn't exist (needs creation)
+      mockOctokit.rest.repos.getContent.mockImplementation(({ path, ref }) => {
+        if (path === '.github/workflows/ci.yml') {
+          return Promise.resolve({
+            data: {
+              sha: ref === 'main' ? 'ci-sha-default' : 'ci-sha-pr',
+              content: Buffer.from(oldCiContent).toString('base64')
+            }
+          });
+        }
+        // release.yml doesn't exist in default branch or PR branch
+        const error = new Error('Not Found');
+        error.status = 404;
+        return Promise.reject(error);
+      });
+
+      // Existing PR found
+      mockOctokit.rest.pulls.list.mockResolvedValue({
+        data: [
+          {
+            number: 50,
+            html_url: 'https://github.com/owner/repo/pull/50'
+          }
+        ]
+      });
+
+      mockOctokit.rest.repos.createOrUpdateFileContents.mockResolvedValue({
+        data: { commit: { sha: 'new-commit-sha' } }
+      });
+
+      const result = await syncWorkflowFiles(
+        mockOctokit,
+        'owner/repo',
+        ['./workflows/ci.yml', './workflows/release.yml'],
+        'chore: update workflow files',
+        false
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.workflowFiles).toBe('pr-updated-mixed');
+      expect(result.prNumber).toBe(50);
+      expect(result.filesCreated).toContain('.github/workflows/release.yml');
+      expect(result.filesUpdated).toContain('.github/workflows/ci.yml');
+      expect(mockOctokit.rest.repos.createOrUpdateFileContents).toHaveBeenCalledTimes(2);
+      expect(mockOctokit.rest.pulls.create).not.toHaveBeenCalled();
+    });
+
+    test('should report pr-up-to-date when PR exists with same content', async () => {
+      const content = 'name: CI\non: [push]';
+      const oldContent = 'name: CI\non: [pull_request]';
+
+      setMockFileContent(content);
+
+      mockOctokit.rest.repos.get.mockResolvedValue({
+        data: { default_branch: 'main' }
+      });
+
+      // Default branch has old content, but PR branch already has the new content
+      mockOctokit.rest.repos.getContent
+        .mockResolvedValueOnce({
+          data: {
+            sha: 'file-sha-default',
+            content: Buffer.from(oldContent).toString('base64')
+          }
+        })
+        .mockResolvedValueOnce({
+          data: {
+            sha: 'file-sha-pr-branch',
+            content: Buffer.from(content).toString('base64')
+          }
+        });
 
       // Existing PR found
       mockOctokit.rest.pulls.list.mockResolvedValue({
@@ -3628,11 +4758,10 @@ describe('Bulk GitHub Repository Settings Action', () => {
       );
 
       expect(result.success).toBe(true);
-      expect(result.workflowFiles).toBe('pr-exists');
+      expect(result.workflowFiles).toBe('pr-up-to-date');
       expect(result.prNumber).toBe(50);
       expect(result.prUrl).toBe('https://github.com/owner/repo/pull/50');
-      expect(mockOctokit.rest.git.createRef).not.toHaveBeenCalled();
-      expect(mockOctokit.rest.git.updateRef).not.toHaveBeenCalled();
+      expect(result.message).toContain('PR #50 already has the latest');
       expect(mockOctokit.rest.repos.createOrUpdateFileContents).not.toHaveBeenCalled();
       expect(mockOctokit.rest.pulls.create).not.toHaveBeenCalled();
     });
@@ -4488,7 +5617,7 @@ describe('Bulk GitHub Repository Settings Action', () => {
       expect(mockOctokit.rest.repos.createOrUpdateFileContents).not.toHaveBeenCalled();
     });
 
-    test('should report existing open PR when one exists', async () => {
+    test('should update existing PR when content differs', async () => {
       const newContent = 'node_modules/\n.env\ndist/\n';
       const oldContent = 'node_modules/\n.env\n';
 
@@ -4498,12 +5627,69 @@ describe('Bulk GitHub Repository Settings Action', () => {
         data: { default_branch: 'main' }
       });
 
-      mockOctokit.rest.repos.getContent.mockResolvedValue({
-        data: {
-          sha: 'file-sha-111',
-          content: Buffer.from(oldContent).toString('base64')
-        }
+      // First call: check default branch, second call: check PR branch
+      mockOctokit.rest.repos.getContent
+        .mockResolvedValueOnce({
+          data: {
+            sha: 'file-sha-default',
+            content: Buffer.from(oldContent).toString('base64')
+          }
+        })
+        .mockResolvedValueOnce({
+          data: {
+            sha: 'file-sha-pr-branch',
+            content: Buffer.from(oldContent).toString('base64')
+          }
+        });
+
+      // Existing PR found
+      mockOctokit.rest.pulls.list.mockResolvedValue({
+        data: [{ number: 50, html_url: 'https://github.com/owner/repo/pull/50' }]
       });
+
+      mockOctokit.rest.repos.createOrUpdateFileContents.mockResolvedValue({
+        data: { commit: { sha: 'new-commit-sha' } }
+      });
+
+      const result = await syncGitignore(mockOctokit, 'owner/repo', './.gitignore', 'chore: update .gitignore', false);
+
+      expect(result.success).toBe(true);
+      expect(result.gitignore).toBe('pr-updated');
+      expect(result.prNumber).toBe(50);
+      expect(result.prUrl).toBe('https://github.com/owner/repo/pull/50');
+      expect(mockOctokit.rest.repos.createOrUpdateFileContents).toHaveBeenCalledWith(
+        expect.objectContaining({
+          branch: 'gitignore-sync',
+          sha: 'file-sha-pr-branch'
+        })
+      );
+      expect(mockOctokit.rest.pulls.create).not.toHaveBeenCalled();
+    });
+
+    test('should report pr-up-to-date when PR exists with same content', async () => {
+      const content = 'node_modules/\n.env\n';
+      const oldContent = 'node_modules/\n';
+
+      setMockFileContent(content);
+
+      mockOctokit.rest.repos.get.mockResolvedValue({
+        data: { default_branch: 'main' }
+      });
+
+      // Default branch has old content, but PR branch already has the new content
+      mockOctokit.rest.repos.getContent
+        .mockResolvedValueOnce({
+          data: {
+            sha: 'file-sha-default',
+            content: Buffer.from(oldContent).toString('base64')
+          }
+        })
+        .mockResolvedValueOnce({
+          data: {
+            sha: 'file-sha-pr-branch',
+            content: Buffer.from(content).toString('base64')
+          }
+        });
 
       // Existing PR found
       mockOctokit.rest.pulls.list.mockResolvedValue({
@@ -4513,9 +5699,10 @@ describe('Bulk GitHub Repository Settings Action', () => {
       const result = await syncGitignore(mockOctokit, 'owner/repo', './.gitignore', 'chore: update .gitignore', false);
 
       expect(result.success).toBe(true);
-      expect(result.gitignore).toBe('pr-exists');
+      expect(result.gitignore).toBe('pr-up-to-date');
       expect(result.prNumber).toBe(50);
-      expect(mockOctokit.rest.git.createRef).not.toHaveBeenCalled();
+      expect(result.prUrl).toBe('https://github.com/owner/repo/pull/50');
+      expect(result.message).toContain('PR #50 already has the latest');
       expect(mockOctokit.rest.repos.createOrUpdateFileContents).not.toHaveBeenCalled();
       expect(mockOctokit.rest.pulls.create).not.toHaveBeenCalled();
     });
@@ -4759,7 +5946,7 @@ describe('Bulk GitHub Repository Settings Action', () => {
       expect(mockOctokit.rest.repos.createOrUpdateFileContents).not.toHaveBeenCalled();
     });
 
-    test('should report existing open PR when one exists', async () => {
+    test('should update existing PR when content differs', async () => {
       const newContent = '# GitHub Copilot Instructions\n\nUpdated standards.';
       const oldContent = '# GitHub Copilot Instructions\n\nOld standards.';
 
@@ -4771,12 +5958,82 @@ describe('Bulk GitHub Repository Settings Action', () => {
         }
       });
 
-      mockOctokit.rest.repos.getContent.mockResolvedValue({
+      // First call: check default branch, second call: check PR branch
+      mockOctokit.rest.repos.getContent
+        .mockResolvedValueOnce({
+          data: {
+            sha: 'file-sha-default',
+            content: Buffer.from(oldContent).toString('base64')
+          }
+        })
+        .mockResolvedValueOnce({
+          data: {
+            sha: 'file-sha-pr-branch',
+            content: Buffer.from(oldContent).toString('base64')
+          }
+        });
+
+      // Existing PR found
+      mockOctokit.rest.pulls.list.mockResolvedValue({
+        data: [
+          {
+            number: 50,
+            html_url: 'https://github.com/owner/repo/pull/50'
+          }
+        ]
+      });
+
+      mockOctokit.rest.repos.createOrUpdateFileContents.mockResolvedValue({
+        data: { commit: { sha: 'new-commit-sha' } }
+      });
+
+      const result = await syncCopilotInstructions(
+        mockOctokit,
+        'owner/repo',
+        './copilot-instructions.md',
+        'chore: update copilot-instructions.md',
+        false
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.copilotInstructions).toBe('pr-updated');
+      expect(result.prNumber).toBe(50);
+      expect(result.prUrl).toBe('https://github.com/owner/repo/pull/50');
+      expect(mockOctokit.rest.repos.createOrUpdateFileContents).toHaveBeenCalledWith(
+        expect.objectContaining({
+          branch: 'copilot-instructions-md-sync',
+          sha: 'file-sha-pr-branch'
+        })
+      );
+      expect(mockOctokit.rest.pulls.create).not.toHaveBeenCalled();
+    });
+
+    test('should report pr-up-to-date when PR exists with same content', async () => {
+      const content = '# GitHub Copilot Instructions\n\nSame standards.';
+      const oldContent = '# GitHub Copilot Instructions\n\nOld standards.';
+
+      setMockFileContent(content);
+
+      mockOctokit.rest.repos.get.mockResolvedValue({
         data: {
-          sha: 'file-sha-999',
-          content: Buffer.from(oldContent).toString('base64')
+          default_branch: 'main'
         }
       });
+
+      // Default branch has old content, but PR branch already has the new content
+      mockOctokit.rest.repos.getContent
+        .mockResolvedValueOnce({
+          data: {
+            sha: 'file-sha-default',
+            content: Buffer.from(oldContent).toString('base64')
+          }
+        })
+        .mockResolvedValueOnce({
+          data: {
+            sha: 'file-sha-pr-branch',
+            content: Buffer.from(content).toString('base64')
+          }
+        });
 
       // Existing PR found
       mockOctokit.rest.pulls.list.mockResolvedValue({
@@ -4797,14 +6054,12 @@ describe('Bulk GitHub Repository Settings Action', () => {
       );
 
       expect(result.success).toBe(true);
-      expect(result.copilotInstructions).toBe('pr-exists');
+      expect(result.copilotInstructions).toBe('pr-up-to-date');
       expect(result.prNumber).toBe(50);
       expect(result.prUrl).toBe('https://github.com/owner/repo/pull/50');
-      expect(mockOctokit.rest.git.createRef).not.toHaveBeenCalled();
-      expect(mockOctokit.rest.git.updateRef).not.toHaveBeenCalled();
+      expect(result.message).toContain('PR #50 already has the latest');
       expect(mockOctokit.rest.repos.createOrUpdateFileContents).not.toHaveBeenCalled();
       expect(mockOctokit.rest.pulls.create).not.toHaveBeenCalled();
-      expect(mockOctokit.rest.pulls.update).not.toHaveBeenCalled();
     });
 
     test('should handle dry-run mode', async () => {
@@ -5123,9 +6378,10 @@ describe('Bulk GitHub Repository Settings Action', () => {
       expect(mockOctokit.rest.pulls.create).not.toHaveBeenCalled();
     });
 
-    test('should report existing open PR when one exists', async () => {
+    test('should update existing PR when content differs', async () => {
       const sourcePackageJson = { scripts: { test: 'jest' } };
       const existingPackageJson = { scripts: { test: 'mocha' } };
+      const prBranchPackageJson = { scripts: { test: 'old-test' } };
 
       setMockFileContent(JSON.stringify(sourcePackageJson));
 
@@ -5133,12 +6389,80 @@ describe('Bulk GitHub Repository Settings Action', () => {
         data: { default_branch: 'main' }
       });
 
-      mockOctokit.rest.repos.getContent.mockResolvedValue({
-        data: {
-          sha: 'file-sha-111',
-          content: Buffer.from(JSON.stringify(existingPackageJson)).toString('base64')
-        }
+      // First call: get existing package.json from default branch
+      // Second call: get package.json from PR branch
+      mockOctokit.rest.repos.getContent
+        .mockResolvedValueOnce({
+          data: {
+            sha: 'file-sha-111',
+            content: Buffer.from(JSON.stringify(existingPackageJson)).toString('base64')
+          }
+        })
+        .mockResolvedValueOnce({
+          data: {
+            sha: 'pr-file-sha-111',
+            content: Buffer.from(JSON.stringify(prBranchPackageJson)).toString('base64')
+          }
+        });
+
+      mockOctokit.rest.pulls.list.mockResolvedValue({
+        data: [{ number: 50, html_url: 'https://github.com/owner/repo/pull/50' }]
       });
+
+      mockOctokit.rest.repos.createOrUpdateFileContents.mockResolvedValue({
+        data: { commit: { sha: 'updated-sha' } }
+      });
+
+      const result = await syncPackageJson(
+        mockOctokit,
+        'owner/repo',
+        './package.json',
+        true, // syncScripts
+        false, // syncEngines
+        'chore: update package.json',
+        false
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.packageJson).toBe('pr-updated');
+      expect(result.prNumber).toBe(50);
+      expect(mockOctokit.rest.repos.createOrUpdateFileContents).toHaveBeenCalledWith(
+        expect.objectContaining({
+          branch: 'package-json-sync',
+          sha: 'pr-file-sha-111'
+        })
+      );
+      expect(mockOctokit.rest.git.createRef).not.toHaveBeenCalled();
+      expect(mockOctokit.rest.pulls.create).not.toHaveBeenCalled();
+    });
+
+    test('should report pr-up-to-date when PR exists with same content', async () => {
+      const sourcePackageJson = { scripts: { test: 'jest' } };
+      const existingPackageJson = { scripts: { test: 'mocha' } };
+      // PR branch already has the source scripts
+      const prBranchPackageJson = { scripts: { test: 'jest' } };
+
+      setMockFileContent(JSON.stringify(sourcePackageJson));
+
+      mockOctokit.rest.repos.get.mockResolvedValue({
+        data: { default_branch: 'main' }
+      });
+
+      // First call: get existing package.json from default branch (different from source)
+      // Second call: get package.json from PR branch (same as source)
+      mockOctokit.rest.repos.getContent
+        .mockResolvedValueOnce({
+          data: {
+            sha: 'file-sha-default',
+            content: Buffer.from(JSON.stringify(existingPackageJson)).toString('base64')
+          }
+        })
+        .mockResolvedValueOnce({
+          data: {
+            sha: 'pr-file-sha',
+            content: Buffer.from(JSON.stringify(prBranchPackageJson)).toString('base64')
+          }
+        });
 
       mockOctokit.rest.pulls.list.mockResolvedValue({
         data: [{ number: 50, html_url: 'https://github.com/owner/repo/pull/50' }]
@@ -5155,9 +6479,10 @@ describe('Bulk GitHub Repository Settings Action', () => {
       );
 
       expect(result.success).toBe(true);
-      expect(result.packageJson).toBe('pr-exists');
+      expect(result.packageJson).toBe('pr-up-to-date');
       expect(result.prNumber).toBe(50);
-      expect(mockOctokit.rest.git.createRef).not.toHaveBeenCalled();
+      expect(mockOctokit.rest.repos.createOrUpdateFileContents).not.toHaveBeenCalled();
+      expect(mockOctokit.rest.pulls.create).not.toHaveBeenCalled();
     });
 
     test('should handle dry-run mode', async () => {
@@ -5197,6 +6522,56 @@ describe('Bulk GitHub Repository Settings Action', () => {
       expect(mockOctokit.rest.pulls.create).not.toHaveBeenCalled();
     });
 
+    test('should return would-update-pr in dry-run mode when PR exists and needs update', async () => {
+      const sourcePackageJson = { scripts: { test: 'jest' } };
+      const existingPackageJson = { scripts: { test: 'mocha' } };
+      const prBranchPackageJson = { scripts: { test: 'old-test' } };
+
+      setMockFileContent(JSON.stringify(sourcePackageJson));
+
+      mockOctokit.rest.repos.get.mockResolvedValue({
+        data: { default_branch: 'main' }
+      });
+
+      // First call: get existing package.json from default branch
+      // Second call: get package.json from PR branch (different from source, needs update)
+      mockOctokit.rest.repos.getContent
+        .mockResolvedValueOnce({
+          data: {
+            sha: 'file-sha-default',
+            content: Buffer.from(JSON.stringify(existingPackageJson)).toString('base64')
+          }
+        })
+        .mockResolvedValueOnce({
+          data: {
+            sha: 'pr-file-sha',
+            content: Buffer.from(JSON.stringify(prBranchPackageJson)).toString('base64')
+          }
+        });
+
+      mockOctokit.rest.pulls.list.mockResolvedValue({
+        data: [{ number: 50, html_url: 'https://github.com/owner/repo/pull/50' }]
+      });
+
+      const result = await syncPackageJson(
+        mockOctokit,
+        'owner/repo',
+        './package.json',
+        true, // syncScripts
+        false, // syncEngines
+        'chore: update package.json',
+        true // dry-run
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.packageJson).toBe('would-update-pr');
+      expect(result.prNumber).toBe(50);
+      expect(result.dryRun).toBe(true);
+      expect(mockOctokit.rest.repos.createOrUpdateFileContents).not.toHaveBeenCalled();
+      expect(mockOctokit.rest.git.createRef).not.toHaveBeenCalled();
+      expect(mockOctokit.rest.pulls.create).not.toHaveBeenCalled();
+    });
+
     test('should fail when package.json does not exist in target repo', async () => {
       setMockFileContent(JSON.stringify({ scripts: {} }));
 
@@ -5204,7 +6579,9 @@ describe('Bulk GitHub Repository Settings Action', () => {
         data: { default_branch: 'main' }
       });
 
-      mockOctokit.rest.repos.getContent.mockRejectedValue({ status: 404 });
+      const error = new Error('Not Found');
+      error.status = 404;
+      mockOctokit.rest.repos.getContent.mockRejectedValue(error);
 
       const result = await syncPackageJson(
         mockOctokit,

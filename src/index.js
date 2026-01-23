@@ -257,6 +257,11 @@ export async function parseRepositories(repositories, repositoriesFile, owner, o
  * @param {boolean} enableCodeScanning - Enable default CodeQL scanning
  * @param {boolean|null} immutableReleases - Enable or disable immutable releases
  * @param {Array<string>|null} topics - Topics to set on repository
+ * @param {Object} securitySettings - Security settings to update
+ * @param {boolean|null} securitySettings.secretScanning - Enable or disable secret scanning
+ * @param {boolean|null} securitySettings.secretScanningPushProtection - Enable or disable push protection
+ * @param {boolean|null} securitySettings.dependabotAlerts - Enable or disable Dependabot alerts
+ * @param {boolean|null} securitySettings.dependabotSecurityUpdates - Enable or disable Dependabot security updates
  * @param {boolean} dryRun - Preview mode without making actual changes
  * @returns {Promise<Object>} Result object
  */
@@ -267,6 +272,7 @@ export async function updateRepositorySettings(
   enableCodeScanning,
   immutableReleases,
   topics,
+  securitySettings,
   dryRun
 ) {
   const [owner, repoName] = repo.split('/');
@@ -593,6 +599,207 @@ export async function updateRepositorySettings(
       }
     }
 
+    // Handle security settings (only if securitySettings object is provided)
+    if (securitySettings) {
+      // Handle secret scanning settings
+      if (securitySettings.secretScanning !== null) {
+        try {
+          // Get current secret scanning status from security_and_analysis
+          const currentSecretScanning = currentRepo.security_and_analysis?.secret_scanning?.status === 'enabled';
+          result.currentSecretScanning = currentSecretScanning;
+
+          if (currentSecretScanning !== securitySettings.secretScanning) {
+            result.secretScanningChange = {
+              from: currentSecretScanning,
+              to: securitySettings.secretScanning
+            };
+
+            if (!dryRun) {
+              await octokit.rest.repos.update({
+                owner,
+                repo: repoName,
+                security_and_analysis: {
+                  secret_scanning: {
+                    status: securitySettings.secretScanning ? 'enabled' : 'disabled'
+                  }
+                }
+              });
+              result.secretScanningUpdated = true;
+            } else {
+              result.secretScanningWouldUpdate = true;
+            }
+          } else {
+            result.secretScanningUnchanged = true;
+          }
+        } catch (error) {
+          result.secretScanningWarning = `Could not process secret scanning: ${error.message}`;
+        }
+      }
+
+      // Handle secret scanning push protection settings
+      if (securitySettings.secretScanningPushProtection !== null) {
+        try {
+          // Get current push protection status from security_and_analysis
+          const currentPushProtection =
+            currentRepo.security_and_analysis?.secret_scanning_push_protection?.status === 'enabled';
+          result.currentSecretScanningPushProtection = currentPushProtection;
+
+          if (currentPushProtection !== securitySettings.secretScanningPushProtection) {
+            result.secretScanningPushProtectionChange = {
+              from: currentPushProtection,
+              to: securitySettings.secretScanningPushProtection
+            };
+
+            if (!dryRun) {
+              await octokit.rest.repos.update({
+                owner,
+                repo: repoName,
+                security_and_analysis: {
+                  secret_scanning_push_protection: {
+                    status: securitySettings.secretScanningPushProtection ? 'enabled' : 'disabled'
+                  }
+                }
+              });
+              result.secretScanningPushProtectionUpdated = true;
+            } else {
+              result.secretScanningPushProtectionWouldUpdate = true;
+            }
+          } else {
+            result.secretScanningPushProtectionUnchanged = true;
+          }
+        } catch (error) {
+          result.secretScanningPushProtectionWarning = `Could not process secret scanning push protection: ${error.message}`;
+        }
+      }
+
+      // Handle Dependabot alerts (vulnerability alerts)
+      if (securitySettings.dependabotAlerts !== null) {
+        try {
+          // Check current vulnerability alerts status
+          let currentDependabotAlerts = false;
+          try {
+            await octokit.request('GET /repos/{owner}/{repo}/vulnerability-alerts', {
+              owner,
+              repo: repoName,
+              headers: {
+                'X-GitHub-Api-Version': '2022-11-28'
+              }
+            });
+            // 204 means enabled
+            currentDependabotAlerts = true;
+          } catch (error) {
+            // 404 means disabled
+            if (error.status === 404) {
+              currentDependabotAlerts = false;
+            } else {
+              throw error;
+            }
+          }
+
+          result.currentDependabotAlerts = currentDependabotAlerts;
+
+          if (currentDependabotAlerts !== securitySettings.dependabotAlerts) {
+            result.dependabotAlertsChange = {
+              from: currentDependabotAlerts,
+              to: securitySettings.dependabotAlerts
+            };
+
+            if (!dryRun) {
+              if (securitySettings.dependabotAlerts) {
+                // Enable vulnerability alerts (also enables dependency graph)
+                await octokit.request('PUT /repos/{owner}/{repo}/vulnerability-alerts', {
+                  owner,
+                  repo: repoName,
+                  headers: {
+                    'X-GitHub-Api-Version': '2022-11-28'
+                  }
+                });
+              } else {
+                // Disable vulnerability alerts
+                await octokit.request('DELETE /repos/{owner}/{repo}/vulnerability-alerts', {
+                  owner,
+                  repo: repoName,
+                  headers: {
+                    'X-GitHub-Api-Version': '2022-11-28'
+                  }
+                });
+              }
+              result.dependabotAlertsUpdated = true;
+            } else {
+              result.dependabotAlertsWouldUpdate = true;
+            }
+          } else {
+            result.dependabotAlertsUnchanged = true;
+          }
+        } catch (error) {
+          result.dependabotAlertsWarning = `Could not process Dependabot alerts: ${error.message}`;
+        }
+      }
+
+      // Handle Dependabot security updates
+      if (securitySettings.dependabotSecurityUpdates !== null) {
+        try {
+          // Check current Dependabot security updates status
+          let currentDependabotSecurityUpdates = false;
+          try {
+            const response = await octokit.request('GET /repos/{owner}/{repo}/automated-security-fixes', {
+              owner,
+              repo: repoName,
+              headers: {
+                'X-GitHub-Api-Version': '2022-11-28'
+              }
+            });
+            currentDependabotSecurityUpdates = response.data.enabled === true;
+          } catch (error) {
+            // 404 means disabled
+            if (error.status === 404) {
+              currentDependabotSecurityUpdates = false;
+            } else {
+              throw error;
+            }
+          }
+
+          result.currentDependabotSecurityUpdates = currentDependabotSecurityUpdates;
+
+          if (currentDependabotSecurityUpdates !== securitySettings.dependabotSecurityUpdates) {
+            result.dependabotSecurityUpdatesChange = {
+              from: currentDependabotSecurityUpdates,
+              to: securitySettings.dependabotSecurityUpdates
+            };
+
+            if (!dryRun) {
+              if (securitySettings.dependabotSecurityUpdates) {
+                // Enable Dependabot security updates
+                await octokit.request('PUT /repos/{owner}/{repo}/automated-security-fixes', {
+                  owner,
+                  repo: repoName,
+                  headers: {
+                    'X-GitHub-Api-Version': '2022-11-28'
+                  }
+                });
+              } else {
+                // Disable Dependabot security updates
+                await octokit.request('DELETE /repos/{owner}/{repo}/automated-security-fixes', {
+                  owner,
+                  repo: repoName,
+                  headers: {
+                    'X-GitHub-Api-Version': '2022-11-28'
+                  }
+                });
+              }
+              result.dependabotSecurityUpdatesUpdated = true;
+            } else {
+              result.dependabotSecurityUpdatesWouldUpdate = true;
+            }
+          } else {
+            result.dependabotSecurityUpdatesUnchanged = true;
+          }
+        } catch (error) {
+          result.dependabotSecurityUpdatesWarning = `Could not process Dependabot security updates: ${error.message}`;
+        }
+      }
+    } // End of if (securitySettings)
+
     return result;
   } catch (error) {
     return {
@@ -606,8 +813,9 @@ export async function updateRepositorySettings(
 
 /**
  * Generic function to sync one or more files to a target repository via pull request.
- * If an open PR already exists for the same branch, returns early with 'pr-exists' status
- * to avoid creating duplicate PRs. The existing PR is not updated with new file changes.
+ * If an open PR already exists for the same branch, the function checks if the PR branch
+ * content differs from the new source content. If different, it updates the PR branch with
+ * a new commit. If the content is already up to date, returns 'pr-up-to-date' status.
  * @param {Octokit} octokit - Octokit instance
  * @param {string} repo - Repository in "owner/repo" format
  * @param {Object} options - Sync options
@@ -622,7 +830,19 @@ export async function updateRepositorySettings(
  * @param {Function} [options.contentProcessor.getComparableExisting] - (existingContent) => content to compare against source
  * @param {Function} [options.contentProcessor.getFinalContent] - (sourceContent, existingContent) => content to commit
  * @param {boolean} dryRun - Preview mode without making actual changes
- * @returns {Promise<Object>} Result object
+ * @returns {Promise<Object>} Result object with `success` boolean and `[resultKey]` status string.
+ *   Possible status values:
+ *   - 'unchanged': File(s) already match source, no action needed
+ *   - 'created': New file(s) created via new PR
+ *   - 'updated': Existing file(s) updated via new PR
+ *   - 'mixed': Both new and existing files synced via new PR
+ *   - 'pr-up-to-date': Existing PR already has the latest content
+ *   - 'pr-updated': Existing PR branch updated with new content
+ *   - 'pr-updated-created': New file(s) added to existing PR branch
+ *   - 'pr-updated-mixed': Both new and updated files committed to existing PR branch
+ *   - 'would-create': Dry-run - would create new file(s)
+ *   - 'would-update': Dry-run - would update existing file(s)
+ *   - 'would-update-pr': Dry-run - would update existing PR branch
  */
 export async function syncFilesViaPullRequest(octokit, repo, options, dryRun) {
   const { files, branchName, prTitle, prBodyCreate, prBodyUpdate, resultKey, fileDescription, contentProcessor } =
@@ -751,16 +971,157 @@ export async function syncFilesViaPullRequest(octokit, repo, options, dryRun) {
       core.warning(`  ⚠️  Could not check for existing PRs: ${error.message}`);
     }
 
-    // If there's already an open PR, don't create/update another one
+    // If there's already an open PR, check if content differs and update if needed
     if (existingPR) {
       const targetDesc = fileInfos.length === 1 ? fileInfos[0].targetPath : fileDescription;
+
+      // Fetch content from the PR branch to compare against source
+      const prBranchFilesToUpdate = [];
+      for (const fileInfo of fileInfos) {
+        let prBranchContent = null;
+        let prBranchSha = null;
+
+        try {
+          const { data } = await octokit.rest.repos.getContent({
+            owner,
+            repo: repoName,
+            path: fileInfo.targetPath,
+            ref: branchName
+          });
+          prBranchContent = Buffer.from(data.content, 'base64').toString('utf8');
+          prBranchSha = data.sha;
+        } catch (error) {
+          if (error.status !== 404) {
+            throw error;
+          }
+          // File doesn't exist in PR branch yet
+          core.info(`  📄 ${fileInfo.targetPath} does not exist in PR branch ${branchName}, will create it`);
+        }
+
+        // Compare content - use contentProcessor if provided
+        let comparablePrContent = prBranchContent;
+        let finalContent = fileInfo.content;
+
+        if (contentProcessor && prBranchContent) {
+          comparablePrContent = contentProcessor.getComparableExisting(prBranchContent);
+          finalContent = contentProcessor.getFinalContent(fileInfo.content, prBranchContent);
+        }
+
+        // Use nullish coalescing for safety in case comparablePrContent is null
+        const comparablePrContentTrimmed = (comparablePrContent ?? '').trim();
+        const sourceContentTrimmed = (fileInfo.content ?? '').trim();
+        const prNeedsUpdate = !prBranchContent || comparablePrContentTrimmed !== sourceContentTrimmed;
+
+        if (prNeedsUpdate) {
+          prBranchFilesToUpdate.push({
+            ...fileInfo,
+            existingSha: prBranchSha,
+            existingContent: prBranchContent,
+            finalContent,
+            isNew: !prBranchContent
+          });
+        }
+      }
+
+      // If no files need updates in the PR branch, it's already up to date
+      if (prBranchFilesToUpdate.length === 0) {
+        core.info(`  ✓ PR #${existingPR.number} already has the latest ${targetDesc}`);
+        return {
+          repository: repo,
+          success: true,
+          [resultKey]: 'pr-up-to-date',
+          message: `PR #${existingPR.number} already has the latest ${targetDesc}`,
+          prNumber: existingPR.number,
+          prUrl: existingPR.html_url,
+          filesProcessed: fileInfos.map(f => f.targetPath),
+          dryRun
+        };
+      }
+
+      // PR exists but content differs - update the PR branch
+      core.info(`  🔄 PR #${existingPR.number} exists but content differs, will update`);
+
+      if (dryRun) {
+        const newFiles = prBranchFilesToUpdate.filter(f => f.isNew).map(f => f.targetPath);
+        const updatedFiles = prBranchFilesToUpdate.filter(f => !f.isNew).map(f => f.targetPath);
+        let message;
+        if (fileInfos.length === 1) {
+          message = prBranchFilesToUpdate[0].isNew
+            ? `Would create ${prBranchFilesToUpdate[0].targetPath} in existing PR #${existingPR.number}`
+            : `Would update ${prBranchFilesToUpdate[0].targetPath} in existing PR #${existingPR.number}`;
+        } else {
+          message = `Would update ${prBranchFilesToUpdate.length} file(s) in existing PR #${existingPR.number}`;
+        }
+        return {
+          repository: repo,
+          success: true,
+          [resultKey]: 'would-update-pr',
+          message,
+          prNumber: existingPR.number,
+          prUrl: existingPR.html_url,
+          filesWouldCreate: newFiles.length > 0 ? newFiles : undefined,
+          filesWouldUpdate: updatedFiles.length > 0 ? updatedFiles : undefined,
+          filesProcessed: fileInfos.map(f => f.targetPath),
+          dryRun
+        };
+      }
+
+      // Commit updated files to the PR branch
+      const createdFiles = [];
+      const updatedFiles = [];
+
+      for (const file of prBranchFilesToUpdate) {
+        const commitMessage = file.isNew ? `chore: add ${file.targetPath}` : `chore: update ${file.targetPath}`;
+        const contentToCommit = file.finalContent || file.content;
+
+        await octokit.rest.repos.createOrUpdateFileContents({
+          owner,
+          repo: repoName,
+          path: file.targetPath,
+          message: commitMessage,
+          content: Buffer.from(contentToCommit).toString('base64'),
+          branch: branchName,
+          sha: file.existingSha || undefined
+        });
+
+        if (file.isNew) {
+          createdFiles.push(file.targetPath);
+        } else {
+          updatedFiles.push(file.targetPath);
+        }
+
+        core.info(`  ✍️  Committed changes to ${file.targetPath} in PR #${existingPR.number}`);
+      }
+
+      // Determine status
+      let status;
+      if (createdFiles.length > 0 && updatedFiles.length > 0) {
+        status = 'pr-updated-mixed';
+      } else if (createdFiles.length > 0) {
+        status = 'pr-updated-created';
+      } else {
+        status = 'pr-updated';
+      }
+
+      // Build message
+      let message;
+      if (fileInfos.length === 1) {
+        message = prBranchFilesToUpdate[0].isNew
+          ? `Created ${prBranchFilesToUpdate[0].targetPath} in existing PR #${existingPR.number}`
+          : `Updated ${prBranchFilesToUpdate[0].targetPath} in existing PR #${existingPR.number}`;
+      } else {
+        message = `Updated ${prBranchFilesToUpdate.length} file(s) in existing PR #${existingPR.number}`;
+      }
+
       return {
         repository: repo,
         success: true,
-        [resultKey]: 'pr-exists',
-        message: `Open PR #${existingPR.number} already exists for ${targetDesc}`,
+        [resultKey]: status,
         prNumber: existingPR.number,
         prUrl: existingPR.html_url,
+        message,
+        filesCreated: createdFiles.length > 0 ? createdFiles : undefined,
+        filesUpdated: updatedFiles.length > 0 ? updatedFiles : undefined,
         filesProcessed: fileInfos.map(f => f.targetPath),
         dryRun
       };
@@ -1234,14 +1595,106 @@ export async function syncPackageJson(octokit, repo, packageJsonPath, syncScript
       core.warning(`  ⚠️  Could not check for existing PRs: ${error.message}`);
     }
 
+    // If there's already an open PR, check if content differs and update if needed
     if (existingPR) {
+      // Fetch package.json from PR branch to compare
+      let prBranchPackageJson = null;
+      let prBranchSha = null;
+
+      try {
+        const { data } = await octokit.rest.repos.getContent({
+          owner,
+          repo: repoName,
+          path: targetPath,
+          ref: branchName
+        });
+        prBranchSha = data.sha;
+        const prBranchContent = Buffer.from(data.content, 'base64').toString('utf8');
+        prBranchPackageJson = JSON.parse(prBranchContent);
+      } catch (error) {
+        if (error.status !== 404) {
+          throw error;
+        }
+        // File doesn't exist in PR branch yet (shouldn't happen for package.json, but handle gracefully)
+        core.info(`  📄 ${targetPath} does not exist in PR branch ${branchName}`);
+      }
+
+      // Check if the PR branch already has the desired content
+      let prNeedsUpdate = true;
+      if (prBranchPackageJson) {
+        const prBranchScripts = prBranchPackageJson.scripts || {};
+        const prBranchEngines = prBranchPackageJson.engines || {};
+        const sourceScripts = sourcePackageJson.scripts || {};
+        const sourceEngines = sourcePackageJson.engines || {};
+
+        const scriptsMatch = !syncScripts || deepEqual(sourceScripts, prBranchScripts);
+        const enginesMatch = !syncEngines || deepEqual(sourceEngines, prBranchEngines);
+
+        prNeedsUpdate = !scriptsMatch || !enginesMatch;
+      }
+
+      if (!prNeedsUpdate) {
+        core.info(`  ✓ PR #${existingPR.number} already has the latest ${targetPath}`);
+        return {
+          repository: repo,
+          success: true,
+          packageJson: 'pr-up-to-date',
+          message: `PR #${existingPR.number} already has the latest ${targetPath}`,
+          prNumber: existingPR.number,
+          prUrl: existingPR.html_url,
+          dryRun
+        };
+      }
+
+      // PR exists but content differs - update the PR branch
+      core.info(`  🔄 PR #${existingPR.number} exists but content differs, will update`);
+
+      if (dryRun) {
+        return {
+          repository: repo,
+          success: true,
+          packageJson: 'would-update-pr',
+          message: `Would update ${targetPath} in existing PR #${existingPR.number}`,
+          prNumber: existingPR.number,
+          prUrl: existingPR.html_url,
+          changes,
+          dryRun
+        };
+      }
+
+      // Build the updated package.json using PR branch content as base (to preserve other fields)
+      const prUpdatedPackageJson = prBranchPackageJson ? { ...prBranchPackageJson } : { ...existingPackageJson };
+      if (syncScripts) {
+        prUpdatedPackageJson.scripts = sourcePackageJson.scripts || {};
+      }
+      if (syncEngines) {
+        prUpdatedPackageJson.engines = sourcePackageJson.engines || {};
+      }
+
+      // Commit updated package.json to PR branch
+      const newContent = `${JSON.stringify(prUpdatedPackageJson, null, 2)}\n`;
+      const fileParams = {
+        owner,
+        repo: repoName,
+        path: targetPath,
+        message: `chore: update ${targetPath}`,
+        content: Buffer.from(newContent).toString('base64'),
+        branch: branchName
+      };
+      // Only include SHA if file exists in PR branch (for update), omit for creation
+      if (prBranchSha) {
+        fileParams.sha = prBranchSha;
+      }
+      await octokit.rest.repos.createOrUpdateFileContents(fileParams);
+      core.info(`  ✍️  Committed changes to ${targetPath} in PR #${existingPR.number}`);
+
       return {
         repository: repo,
         success: true,
-        packageJson: 'pr-exists',
-        message: `Open PR #${existingPR.number} already exists for ${targetPath}`,
+        packageJson: 'pr-updated',
         prNumber: existingPR.number,
         prUrl: existingPR.html_url,
+        message: `Updated ${targetPath} in existing PR #${existingPR.number}`,
         changes,
         dryRun
       };
@@ -1999,6 +2452,34 @@ function getChangesList(result, dryRun) {
     changes.push(`${actionText} immutable releases`);
   }
 
+  // Secret scanning changes
+  if (result.secretScanningChange) {
+    const action = result.secretScanningChange.to ? 'enable' : 'disable';
+    const actionText = dryRun ? `Would ${action}` : `${action.charAt(0).toUpperCase()}${action.slice(1)}d`;
+    changes.push(`${actionText} secret scanning`);
+  }
+
+  // Secret scanning push protection changes
+  if (result.secretScanningPushProtectionChange) {
+    const action = result.secretScanningPushProtectionChange.to ? 'enable' : 'disable';
+    const actionText = dryRun ? `Would ${action}` : `${action.charAt(0).toUpperCase()}${action.slice(1)}d`;
+    changes.push(`${actionText} secret scanning push protection`);
+  }
+
+  // Dependabot alerts changes
+  if (result.dependabotAlertsChange) {
+    const action = result.dependabotAlertsChange.to ? 'enable' : 'disable';
+    const actionText = dryRun ? `Would ${action}` : `${action.charAt(0).toUpperCase()}${action.slice(1)}d`;
+    changes.push(`${actionText} Dependabot alerts`);
+  }
+
+  // Dependabot security updates changes
+  if (result.dependabotSecurityUpdatesChange) {
+    const action = result.dependabotSecurityUpdatesChange.to ? 'enable' : 'disable';
+    const actionText = dryRun ? `Would ${action}` : `${action.charAt(0).toUpperCase()}${action.slice(1)}d`;
+    changes.push(`${actionText} Dependabot security updates`);
+  }
+
   // Dependabot changes
   if (
     result.dependabotSync?.success &&
@@ -2133,6 +2614,10 @@ function hasRepositoryChanges(result) {
     result.topicsChange ||
     result.codeScanningChange ||
     result.immutableReleasesChange ||
+    result.secretScanningChange ||
+    result.secretScanningPushProtectionChange ||
+    result.dependabotAlertsChange ||
+    result.dependabotSecurityUpdatesChange ||
     (result.dependabotSync &&
       result.dependabotSync.success &&
       result.dependabotSync.dependabotYml &&
@@ -2190,8 +2675,26 @@ export async function run() {
       allow_update_branch: getBooleanInput('allow-update-branch')
     };
 
-    const enableCodeScanning = getBooleanInput('enable-default-code-scanning');
+    // Handle code-scanning with deprecated alias support
+    const codeScanningNew = getBooleanInput('code-scanning');
+    const codeScanningOld = getBooleanInput('enable-default-code-scanning');
+    let enableCodeScanning = codeScanningNew;
+    if (codeScanningOld !== null) {
+      core.warning('The "enable-default-code-scanning" input is deprecated. Please use "code-scanning" instead.');
+      if (codeScanningNew === null) {
+        enableCodeScanning = codeScanningOld;
+      }
+    }
     const immutableReleases = getBooleanInput('immutable-releases');
+
+    // Get security settings inputs
+    const securitySettings = {
+      secretScanning: getBooleanInput('secret-scanning'),
+      secretScanningPushProtection: getBooleanInput('secret-scanning-push-protection'),
+      dependabotAlerts: getBooleanInput('dependabot-alerts'),
+      dependabotSecurityUpdates: getBooleanInput('dependabot-security-updates')
+    };
+
     const dryRun = getBooleanInput('dry-run');
 
     // Parse topics if provided
@@ -2255,10 +2758,12 @@ export async function run() {
     }
 
     // Check if any settings are specified
+    const hasSecuritySettings = Object.values(securitySettings).some(value => value !== null);
     const hasSettings =
       Object.values(settings).some(value => value !== null) ||
-      enableCodeScanning ||
+      enableCodeScanning !== null ||
       immutableReleases !== null ||
+      hasSecuritySettings ||
       topics !== null ||
       dependabotYml ||
       gitignore ||
@@ -2270,7 +2775,7 @@ export async function run() {
       (packageJsonFile && (syncScripts || syncEngines));
     if (!hasSettings) {
       throw new Error(
-        'At least one repository setting must be specified (or enable-default-code-scanning must be true, or immutable-releases must be specified, or topics must be provided, or dependabot-yml must be specified, or gitignore must be specified, or rulesets-file must be specified, or pull-request-template must be specified, or workflow-files must be specified, or autolinks-file must be specified, or copilot-instructions-md must be specified, or package-json-file with package-json-sync-scripts or package-json-sync-engines must be specified)'
+        'At least one repository setting must be specified (or code-scanning must be true, or immutable-releases must be specified, or security settings must be specified, or topics must be provided, or dependabot-yml must be specified, or gitignore must be specified, or rulesets-file must be specified, or pull-request-template must be specified, or workflow-files must be specified, or autolinks-file must be specified, or copilot-instructions-md must be specified, or package-json-file with package-json-sync-scripts or package-json-sync-engines must be specified)'
       );
     }
 
@@ -2315,6 +2820,22 @@ export async function run() {
     if (copilotInstructionsMd) {
       core.info(`Copilot-instructions.md will be synced from: ${copilotInstructionsMd}`);
     }
+    if (securitySettings.secretScanning !== null) {
+      core.info(`Secret scanning will be ${securitySettings.secretScanning ? 'enabled' : 'disabled'}`);
+    }
+    if (securitySettings.secretScanningPushProtection !== null) {
+      core.info(
+        `Secret scanning push protection will be ${securitySettings.secretScanningPushProtection ? 'enabled' : 'disabled'}`
+      );
+    }
+    if (securitySettings.dependabotAlerts !== null) {
+      core.info(`Dependabot alerts will be ${securitySettings.dependabotAlerts ? 'enabled' : 'disabled'}`);
+    }
+    if (securitySettings.dependabotSecurityUpdates !== null) {
+      core.info(
+        `Dependabot security updates will be ${securitySettings.dependabotSecurityUpdates ? 'enabled' : 'disabled'}`
+      );
+    }
 
     // Update repositories
     const results = [];
@@ -2351,10 +2872,13 @@ export async function run() {
             : settings.allow_update_branch
       };
 
-      const repoEnableCodeScanning =
-        repoConfig['enable-default-code-scanning'] !== undefined
-          ? repoConfig['enable-default-code-scanning']
-          : enableCodeScanning;
+      // Handle repo-specific code scanning (support both new and deprecated input names)
+      let repoEnableCodeScanning = enableCodeScanning;
+      if (repoConfig['code-scanning'] !== undefined) {
+        repoEnableCodeScanning = repoConfig['code-scanning'];
+      } else if (repoConfig['enable-default-code-scanning'] !== undefined) {
+        repoEnableCodeScanning = repoConfig['enable-default-code-scanning'];
+      }
 
       // Handle repo-specific immutable releases
       const repoImmutableReleases =
@@ -2426,6 +2950,24 @@ export async function run() {
         repoCopilotInstructionsMd = repoConfig['copilot-instructions-md'];
       }
 
+      // Handle repo-specific security settings
+      const repoSecuritySettings = {
+        secretScanning:
+          repoConfig['secret-scanning'] !== undefined ? repoConfig['secret-scanning'] : securitySettings.secretScanning,
+        secretScanningPushProtection:
+          repoConfig['secret-scanning-push-protection'] !== undefined
+            ? repoConfig['secret-scanning-push-protection']
+            : securitySettings.secretScanningPushProtection,
+        dependabotAlerts:
+          repoConfig['dependabot-alerts'] !== undefined
+            ? repoConfig['dependabot-alerts']
+            : securitySettings.dependabotAlerts,
+        dependabotSecurityUpdates:
+          repoConfig['dependabot-security-updates'] !== undefined
+            ? repoConfig['dependabot-security-updates']
+            : securitySettings.dependabotSecurityUpdates
+      };
+
       const result = await updateRepositorySettings(
         octokit,
         repo,
@@ -2433,6 +2975,7 @@ export async function run() {
         repoEnableCodeScanning,
         repoImmutableReleases,
         repoTopics,
+        repoSecuritySettings,
         dryRun
       );
       results.push(result);
@@ -2700,6 +3243,86 @@ export async function run() {
 
         if (result.immutableReleasesWarning) {
           core.warning(`  ⚠️ ${result.immutableReleasesWarning}`);
+        }
+
+        // Log secret scanning changes
+        if (result.secretScanningChange) {
+          if (dryRun) {
+            core.info(
+              `  🔍 Would ${result.secretScanningChange.to ? 'enable' : 'disable'} secret scanning: ${result.secretScanningChange.from} → ${result.secretScanningChange.to}`
+            );
+          } else {
+            core.info(
+              `  🔍 Secret scanning ${result.secretScanningChange.to ? 'enabled' : 'disabled'}: ${result.secretScanningChange.from} → ${result.secretScanningChange.to}`
+            );
+          }
+        } else if (result.secretScanningUnchanged) {
+          core.info(`  🔍 Secret scanning unchanged: ${result.currentSecretScanning ? 'enabled' : 'disabled'}`);
+        }
+
+        if (result.secretScanningWarning) {
+          core.warning(`  ⚠️ ${result.secretScanningWarning}`);
+        }
+
+        // Log secret scanning push protection changes
+        if (result.secretScanningPushProtectionChange) {
+          if (dryRun) {
+            core.info(
+              `  🛡️ Would ${result.secretScanningPushProtectionChange.to ? 'enable' : 'disable'} secret scanning push protection: ${result.secretScanningPushProtectionChange.from} → ${result.secretScanningPushProtectionChange.to}`
+            );
+          } else {
+            core.info(
+              `  🛡️ Secret scanning push protection ${result.secretScanningPushProtectionChange.to ? 'enabled' : 'disabled'}: ${result.secretScanningPushProtectionChange.from} → ${result.secretScanningPushProtectionChange.to}`
+            );
+          }
+        } else if (result.secretScanningPushProtectionUnchanged) {
+          core.info(
+            `  🛡️ Secret scanning push protection unchanged: ${result.currentSecretScanningPushProtection ? 'enabled' : 'disabled'}`
+          );
+        }
+
+        if (result.secretScanningPushProtectionWarning) {
+          core.warning(`  ⚠️ ${result.secretScanningPushProtectionWarning}`);
+        }
+
+        // Log Dependabot alerts changes
+        if (result.dependabotAlertsChange) {
+          if (dryRun) {
+            core.info(
+              `  🤖 Would ${result.dependabotAlertsChange.to ? 'enable' : 'disable'} Dependabot alerts: ${result.dependabotAlertsChange.from} → ${result.dependabotAlertsChange.to}`
+            );
+          } else {
+            core.info(
+              `  🤖 Dependabot alerts ${result.dependabotAlertsChange.to ? 'enabled' : 'disabled'}: ${result.dependabotAlertsChange.from} → ${result.dependabotAlertsChange.to}`
+            );
+          }
+        } else if (result.dependabotAlertsUnchanged) {
+          core.info(`  🤖 Dependabot alerts unchanged: ${result.currentDependabotAlerts ? 'enabled' : 'disabled'}`);
+        }
+
+        if (result.dependabotAlertsWarning) {
+          core.warning(`  ⚠️ ${result.dependabotAlertsWarning}`);
+        }
+
+        // Log Dependabot security updates changes
+        if (result.dependabotSecurityUpdatesChange) {
+          if (dryRun) {
+            core.info(
+              `  🔄 Would ${result.dependabotSecurityUpdatesChange.to ? 'enable' : 'disable'} Dependabot security updates: ${result.dependabotSecurityUpdatesChange.from} → ${result.dependabotSecurityUpdatesChange.to}`
+            );
+          } else {
+            core.info(
+              `  🔄 Dependabot security updates ${result.dependabotSecurityUpdatesChange.to ? 'enabled' : 'disabled'}: ${result.dependabotSecurityUpdatesChange.from} → ${result.dependabotSecurityUpdatesChange.to}`
+            );
+          }
+        } else if (result.dependabotSecurityUpdatesUnchanged) {
+          core.info(
+            `  🔄 Dependabot security updates unchanged: ${result.currentDependabotSecurityUpdates ? 'enabled' : 'disabled'}`
+          );
+        }
+
+        if (result.dependabotSecurityUpdatesWarning) {
+          core.warning(`  ⚠️ ${result.dependabotSecurityUpdatesWarning}`);
         }
       } else {
         failureCount++;
