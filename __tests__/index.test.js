@@ -12,6 +12,7 @@ const mockCore = {
   setFailed: jest.fn(),
   info: jest.fn(),
   warning: jest.fn(),
+  debug: jest.fn(),
   setSecret: jest.fn(),
   summary: {
     addHeading: jest.fn().mockReturnThis(),
@@ -148,6 +149,12 @@ inputs:
     description: 'Copilot instructions md'
   copilot-instructions-pr-title:
     description: 'Copilot instructions PR title'
+  codeowners:
+    description: 'Codeowners file'
+  codeowners-target-path:
+    description: 'Codeowners target path'
+  codeowners-pr-title:
+    description: 'Codeowners PR title'
   package-json-file:
     description: 'Package json file'
   package-json-sync-scripts:
@@ -195,6 +202,9 @@ const mockActionYmlParsed = {
     'autolinks-file': { description: 'Autolinks file' },
     'copilot-instructions-md': { description: 'Copilot instructions md' },
     'copilot-instructions-pr-title': { description: 'Copilot instructions PR title' },
+    codeowners: { description: 'Codeowners file' },
+    'codeowners-target-path': { description: 'Codeowners target path' },
+    'codeowners-pr-title': { description: 'Codeowners PR title' },
     'package-json-file': { description: 'Package json file' },
     'package-json-sync-scripts': { description: 'Sync scripts' },
     'package-json-sync-engines': { description: 'Sync engines' },
@@ -271,6 +281,8 @@ setupDefaultMocks();
 const {
   default: run,
   parseRepositories,
+  filterRepositoriesByCustomProperty,
+  parseConfigWithRules,
   updateRepositorySettings,
   syncDependabotYml,
   syncGitignore,
@@ -279,8 +291,10 @@ const {
   syncWorkflowFiles,
   syncAutolinks,
   syncCopilotInstructions,
+  syncCodeowners,
   syncPackageJson,
-  resetKnownRepoConfigKeysCache
+  resetKnownRepoConfigKeysCache,
+  replaceTemplateVariables
 } = await import('../src/index.js');
 
 describe('Bulk GitHub Repository Settings Action', () => {
@@ -406,14 +420,42 @@ describe('Bulk GitHub Repository Settings Action', () => {
       expect(mockCore.warning).not.toHaveBeenCalledWith(expect.stringContaining('Unknown configuration key'));
     });
 
-    test('should reject YAML file without repos array', async () => {
+    test('should not warn about codeowners-vars configuration key', async () => {
+      setMockFileContent(
+        'repos:\n  - repo: owner/repo1\n    codeowners: ./template\n    codeowners-vars:\n      team: "@org/team"'
+      );
+      setMockYamlContent({
+        repos: [
+          {
+            repo: 'owner/repo1',
+            codeowners: './template',
+            'codeowners-vars': { team: '@org/team' }
+          }
+        ]
+      });
+
+      mockCore.warning.mockClear();
+      const result = await parseRepositories('', 'repos.yml', '', mockOctokit);
+      expect(result).toEqual([
+        {
+          repo: 'owner/repo1',
+          codeowners: './template',
+          'codeowners-vars': { team: '@org/team' }
+        }
+      ]);
+      // codeowners-vars is a YAML-only config, should not warn
+      expect(mockCore.warning).not.toHaveBeenCalledWith(expect.stringContaining('Unknown configuration key'));
+      expect(mockCore.warning).not.toHaveBeenCalledWith(expect.stringContaining('codeowners-vars'));
+    });
+
+    test('should reject YAML file without repos or rules array', async () => {
       setMockFileContent('repositories:\n  - owner/repo1');
       setMockYamlContent({
         repositories: ['owner/repo1']
       });
 
       await expect(parseRepositories('', 'repos.yml', '', mockOctokit)).rejects.toThrow(
-        'YAML file must contain a "repos" array'
+        'YAML file must contain a "rules" array or "repos" array'
       );
     });
 
@@ -453,6 +495,600 @@ describe('Bulk GitHub Repository Settings Action', () => {
 
     test('should throw error when no repositories specified', async () => {
       await expect(parseRepositories('', '', '', mockOctokit)).rejects.toThrow('No repositories specified');
+    });
+
+    test('should filter repositories by custom property', async () => {
+      // Mock organization check
+      mockOctokit.rest.orgs.get.mockResolvedValue({ data: { login: 'my-org' } });
+
+      // Mock org-level properties API (efficient single call)
+      mockOctokit.request.mockResolvedValueOnce({
+        data: [
+          {
+            repository_id: 1,
+            repository_name: 'repo1',
+            repository_full_name: 'my-org/repo1',
+            properties: [{ property_name: 'environment', value: 'production' }]
+          },
+          {
+            repository_id: 2,
+            repository_name: 'repo2',
+            repository_full_name: 'my-org/repo2',
+            properties: [{ property_name: 'environment', value: 'staging' }]
+          },
+          {
+            repository_id: 3,
+            repository_name: 'repo3',
+            repository_full_name: 'my-org/repo3',
+            properties: [{ property_name: 'environment', value: 'production' }]
+          }
+        ]
+      });
+
+      const result = await parseRepositories('', '', 'my-org', mockOctokit, 'environment', 'production');
+
+      expect(result).toEqual([{ repo: 'my-org/repo1' }, { repo: 'my-org/repo3' }]);
+      expect(mockOctokit.request).toHaveBeenCalledWith('GET /orgs/{org}/properties/values', {
+        org: 'my-org',
+        per_page: 100,
+        page: 1
+      });
+    });
+
+    test('should filter repositories by multiple custom property values', async () => {
+      // Mock organization check
+      mockOctokit.rest.orgs.get.mockResolvedValue({ data: { login: 'my-org' } });
+
+      // Mock org-level properties API
+      mockOctokit.request.mockResolvedValueOnce({
+        data: [
+          {
+            repository_id: 1,
+            repository_name: 'repo1',
+            repository_full_name: 'my-org/repo1',
+            properties: [{ property_name: 'environment', value: 'production' }]
+          },
+          {
+            repository_id: 2,
+            repository_name: 'repo2',
+            repository_full_name: 'my-org/repo2',
+            properties: [{ property_name: 'environment', value: 'staging' }]
+          },
+          {
+            repository_id: 3,
+            repository_name: 'repo3',
+            repository_full_name: 'my-org/repo3',
+            properties: [{ property_name: 'environment', value: 'development' }]
+          }
+        ]
+      });
+
+      const result = await parseRepositories('', '', 'my-org', mockOctokit, 'environment', 'production,staging');
+
+      expect(result).toEqual([{ repo: 'my-org/repo1' }, { repo: 'my-org/repo2' }]);
+    });
+
+    test('should throw error when custom-property-name provided without custom-property-value', async () => {
+      await expect(parseRepositories('', '', 'my-org', mockOctokit, 'environment', '')).rejects.toThrow(
+        'custom-property-value must be specified when custom-property-name is provided'
+      );
+    });
+
+    test('should throw error when custom-property-value provided without custom-property-name', async () => {
+      await expect(parseRepositories('', '', 'my-org', mockOctokit, '', 'production')).rejects.toThrow(
+        'custom-property-name must be specified when custom-property-value is provided'
+      );
+    });
+
+    test('should throw error when custom-property-value contains only empty values', async () => {
+      await expect(parseRepositories('', '', 'my-org', mockOctokit, 'environment', ' , , ')).rejects.toThrow(
+        'custom-property-value must contain at least one non-empty value after trimming'
+      );
+    });
+  });
+
+  describe('filterRepositoriesByCustomProperty', () => {
+    test('should throw error when owner is not specified', async () => {
+      await expect(filterRepositoriesByCustomProperty(mockOctokit, '', 'environment', ['production'])).rejects.toThrow(
+        'Owner (organization) must be specified when filtering by custom property'
+      );
+    });
+
+    test('should throw error when property name is not specified', async () => {
+      await expect(filterRepositoriesByCustomProperty(mockOctokit, 'my-org', '', ['production'])).rejects.toThrow(
+        'Custom property name must be specified'
+      );
+    });
+
+    test('should throw error when property values are not specified', async () => {
+      await expect(filterRepositoriesByCustomProperty(mockOctokit, 'my-org', 'environment', [])).rejects.toThrow(
+        'At least one custom property value must be specified'
+      );
+    });
+
+    test('should throw error when owner is not an organization (404)', async () => {
+      const notFoundError = new Error('Not found');
+      notFoundError.status = 404;
+      mockOctokit.rest.orgs.get.mockRejectedValue(notFoundError);
+
+      await expect(
+        filterRepositoriesByCustomProperty(mockOctokit, 'user-account', 'environment', ['production'])
+      ).rejects.toThrow('Custom properties are only available for organizations');
+    });
+
+    test('should rethrow non-404 errors from org check', async () => {
+      const permissionError = new Error('Forbidden');
+      permissionError.status = 403;
+      mockOctokit.rest.orgs.get.mockRejectedValue(permissionError);
+
+      await expect(
+        filterRepositoriesByCustomProperty(mockOctokit, 'my-org', 'environment', ['production'])
+      ).rejects.toThrow('Forbidden');
+    });
+
+    test('should filter repositories by custom property successfully', async () => {
+      // Mock organization check
+      mockOctokit.rest.orgs.get.mockResolvedValue({ data: { login: 'my-org' } });
+
+      // Mock org-level properties API
+      mockOctokit.request.mockResolvedValueOnce({
+        data: [
+          {
+            repository_id: 1,
+            repository_name: 'repo1',
+            repository_full_name: 'my-org/repo1',
+            properties: [{ property_name: 'environment', value: 'production' }]
+          },
+          {
+            repository_id: 2,
+            repository_name: 'repo2',
+            repository_full_name: 'my-org/repo2',
+            properties: [{ property_name: 'environment', value: 'staging' }]
+          }
+        ]
+      });
+
+      const result = await filterRepositoriesByCustomProperty(mockOctokit, 'my-org', 'environment', ['production']);
+
+      expect(result).toEqual([{ repo: 'my-org/repo1' }]);
+      expect(mockCore.info).toHaveBeenCalledWith(
+        expect.stringContaining('Fetching repositories with custom property "environment"')
+      );
+      expect(mockCore.info).toHaveBeenCalledWith(
+        expect.stringContaining('Found 1 repositories matching custom property filter')
+      );
+    });
+
+    test('should handle repositories without custom properties', async () => {
+      // Mock organization check
+      mockOctokit.rest.orgs.get.mockResolvedValue({ data: { login: 'my-org' } });
+
+      // Mock org-level properties API with repos that have no matching properties
+      mockOctokit.request.mockResolvedValueOnce({
+        data: [
+          {
+            repository_id: 1,
+            repository_name: 'repo1',
+            repository_full_name: 'my-org/repo1',
+            properties: [] // No properties
+          }
+        ]
+      });
+
+      const result = await filterRepositoriesByCustomProperty(mockOctokit, 'my-org', 'environment', ['production']);
+
+      expect(result).toEqual([]);
+    });
+  });
+
+  describe('parseConfigWithRules', () => {
+    test('should throw error when rules array is missing', async () => {
+      const config = { owner: 'my-org' };
+      await expect(parseConfigWithRules(config, mockOctokit)).rejects.toThrow(
+        'Configuration must contain a "rules" array'
+      );
+    });
+
+    test('should throw error when owner is missing', async () => {
+      const config = { rules: [] };
+      await expect(parseConfigWithRules(config, mockOctokit)).rejects.toThrow('Configuration must specify an "owner"');
+    });
+
+    test('should throw error when rule has no selector', async () => {
+      const config = {
+        owner: 'my-org',
+        rules: [{ settings: { 'allow-squash-merge': true } }]
+      };
+      await expect(parseConfigWithRules(config, mockOctokit)).rejects.toThrow('Rule 1 must have a "selector" property');
+    });
+
+    test('should process custom-property selector', async () => {
+      // Mock organization check
+      mockOctokit.rest.orgs.get.mockResolvedValue({ data: { login: 'my-org' } });
+
+      // Mock org-level properties API
+      mockOctokit.request.mockResolvedValueOnce({
+        data: [
+          {
+            repository_id: 1,
+            repository_name: 'repo1',
+            repository_full_name: 'my-org/repo1',
+            properties: [{ property_name: 'environment', value: 'production' }]
+          },
+          {
+            repository_id: 2,
+            repository_name: 'repo2',
+            repository_full_name: 'my-org/repo2',
+            properties: [{ property_name: 'environment', value: 'staging' }]
+          }
+        ]
+      });
+
+      const config = {
+        owner: 'my-org',
+        rules: [
+          {
+            selector: {
+              'custom-property': {
+                name: 'environment',
+                values: ['production']
+              }
+            },
+            settings: {
+              'allow-squash-merge': true,
+              'code-scanning': true
+            }
+          }
+        ]
+      };
+
+      const result = await parseConfigWithRules(config, mockOctokit);
+
+      expect(result).toEqual([
+        {
+          repo: 'my-org/repo1',
+          'allow-squash-merge': true,
+          'code-scanning': true
+        }
+      ]);
+    });
+
+    test('should handle scalar value in custom-property selector (values: production)', async () => {
+      // Mock organization check
+      mockOctokit.rest.orgs.get.mockResolvedValue({ data: { login: 'my-org' } });
+
+      // Mock org-level properties API
+      mockOctokit.request.mockResolvedValueOnce({
+        data: [
+          {
+            repository_id: 1,
+            repository_name: 'repo1',
+            repository_full_name: 'my-org/repo1',
+            properties: [{ property_name: 'environment', value: 'production' }]
+          }
+        ]
+      });
+
+      const config = {
+        owner: 'my-org',
+        rules: [
+          {
+            selector: {
+              'custom-property': {
+                name: 'environment',
+                values: 'production' // Scalar instead of array
+              }
+            },
+            settings: {
+              'allow-squash-merge': true
+            }
+          }
+        ]
+      };
+
+      const result = await parseConfigWithRules(config, mockOctokit);
+
+      expect(result).toEqual([
+        {
+          repo: 'my-org/repo1',
+          'allow-squash-merge': true
+        }
+      ]);
+    });
+
+    test('should throw error for invalid values type in custom-property selector', async () => {
+      const config = {
+        owner: 'my-org',
+        rules: [
+          {
+            selector: {
+              'custom-property': {
+                name: 'environment',
+                values: { invalid: 'object' }
+              }
+            },
+            settings: {
+              'allow-squash-merge': true
+            }
+          }
+        ]
+      };
+
+      await expect(parseConfigWithRules(config, mockOctokit)).rejects.toThrow(
+        'Rule 1: custom-property "values" must be a scalar or an array of scalars'
+      );
+    });
+
+    test('should throw error when custom-property name is not a string', async () => {
+      const configWithNumber = {
+        owner: 'my-org',
+        rules: [
+          {
+            selector: {
+              'custom-property': {
+                name: 123,
+                values: ['production']
+              }
+            },
+            settings: { 'allow-squash-merge': true }
+          }
+        ]
+      };
+
+      await expect(parseConfigWithRules(configWithNumber, mockOctokit)).rejects.toThrow(
+        'Rule 1: custom-property selector "name" must be a non-empty string'
+      );
+
+      const configWithEmpty = {
+        owner: 'my-org',
+        rules: [
+          {
+            selector: {
+              'custom-property': {
+                name: '  ',
+                values: ['production']
+              }
+            },
+            settings: { 'allow-squash-merge': true }
+          }
+        ]
+      };
+
+      await expect(parseConfigWithRules(configWithEmpty, mockOctokit)).rejects.toThrow(
+        'Rule 1: custom-property selector "name" must be a non-empty string'
+      );
+    });
+
+    test('should not allow rule.settings to overwrite repo field', async () => {
+      const config = {
+        owner: 'my-org',
+        rules: [
+          {
+            selector: {
+              repos: ['my-org/correct-repo']
+            },
+            settings: {
+              repo: 'my-org/wrong-repo', // Accidental repo field should be ignored
+              'allow-squash-merge': true
+            }
+          }
+        ]
+      };
+
+      const result = await parseConfigWithRules(config, mockOctokit);
+
+      expect(result).toEqual([
+        {
+          repo: 'my-org/correct-repo', // Should preserve the correct repo name
+          'allow-squash-merge': true
+        }
+      ]);
+    });
+
+    test('should process explicit repos selector', async () => {
+      const config = {
+        owner: 'my-org',
+        rules: [
+          {
+            selector: {
+              repos: ['my-org/repo1', 'repo2'] // Test both full name and short name
+            },
+            settings: {
+              'delete-branch-on-merge': true
+            }
+          }
+        ]
+      };
+
+      const result = await parseConfigWithRules(config, mockOctokit);
+
+      expect(result).toEqual([
+        { repo: 'my-org/repo1', 'delete-branch-on-merge': true },
+        { repo: 'my-org/repo2', 'delete-branch-on-merge': true }
+      ]);
+    });
+
+    test('should throw error for invalid repos selector entries', async () => {
+      const configWithNumber = {
+        owner: 'my-org',
+        rules: [
+          {
+            selector: {
+              repos: ['my-org/repo1', 123]
+            },
+            settings: { 'delete-branch-on-merge': true }
+          }
+        ]
+      };
+
+      await expect(parseConfigWithRules(configWithNumber, mockOctokit)).rejects.toThrow(
+        'Rule 1: repos selector entry 2 must be a non-empty string, got: number'
+      );
+
+      const configWithEmpty = {
+        owner: 'my-org',
+        rules: [
+          {
+            selector: {
+              repos: ['my-org/repo1', '  ']
+            },
+            settings: { 'delete-branch-on-merge': true }
+          }
+        ]
+      };
+
+      await expect(parseConfigWithRules(configWithEmpty, mockOctokit)).rejects.toThrow(
+        'Rule 1: repos selector entry 2 must be a non-empty string, got: string'
+      );
+    });
+
+    test('should merge settings from multiple rules', async () => {
+      // Mock organization check
+      mockOctokit.rest.orgs.get.mockResolvedValue({ data: { login: 'my-org' } });
+
+      // Mock org-level properties API
+      mockOctokit.request.mockResolvedValueOnce({
+        data: [
+          {
+            repository_id: 1,
+            repository_name: 'repo1',
+            repository_full_name: 'my-org/repo1',
+            properties: [{ property_name: 'environment', value: 'production' }]
+          }
+        ]
+      });
+
+      const config = {
+        owner: 'my-org',
+        rules: [
+          {
+            selector: {
+              'custom-property': {
+                name: 'environment',
+                values: ['production']
+              }
+            },
+            settings: {
+              'allow-squash-merge': true,
+              'code-scanning': true
+            }
+          },
+          {
+            selector: {
+              repos: ['my-org/repo1']
+            },
+            settings: {
+              'code-scanning': false, // Override from first rule
+              'immutable-releases': true
+            }
+          }
+        ]
+      };
+
+      const result = await parseConfigWithRules(config, mockOctokit);
+
+      expect(result).toEqual([
+        {
+          repo: 'my-org/repo1',
+          'allow-squash-merge': true,
+          'code-scanning': false, // Later rule overrides
+          'immutable-releases': true
+        }
+      ]);
+    });
+
+    test('should handle multiple repos from different rules', async () => {
+      // Mock organization check
+      mockOctokit.rest.orgs.get.mockResolvedValue({ data: { login: 'my-org' } });
+
+      // Mock org-level properties API
+      mockOctokit.request.mockResolvedValueOnce({
+        data: [
+          {
+            repository_id: 1,
+            repository_name: 'repo1',
+            repository_full_name: 'my-org/repo1',
+            properties: [{ property_name: 'env', value: 'prod' }]
+          },
+          {
+            repository_id: 2,
+            repository_name: 'repo2',
+            repository_full_name: 'my-org/repo2',
+            properties: [{ property_name: 'env', value: 'staging' }]
+          }
+        ]
+      });
+
+      const config = {
+        owner: 'my-org',
+        rules: [
+          {
+            selector: {
+              'custom-property': { name: 'env', values: ['prod'] }
+            },
+            settings: { 'code-scanning': true }
+          },
+          {
+            selector: {
+              repos: ['my-org/repo3']
+            },
+            settings: { 'allow-squash-merge': true }
+          }
+        ]
+      };
+
+      const result = await parseConfigWithRules(config, mockOctokit);
+
+      expect(result).toHaveLength(2);
+      expect(result).toContainEqual({ repo: 'my-org/repo1', 'code-scanning': true });
+      expect(result).toContainEqual({ repo: 'my-org/repo3', 'allow-squash-merge': true });
+    });
+
+    test('should skip rules without settings with warning', async () => {
+      const config = {
+        owner: 'my-org',
+        rules: [
+          {
+            selector: { repos: ['my-org/repo1'] }
+            // No settings
+          }
+        ]
+      };
+
+      const result = await parseConfigWithRules(config, mockOctokit);
+
+      expect(result).toEqual([]);
+      expect(mockCore.warning).toHaveBeenCalledWith('Rule 1 has no settings, skipping');
+    });
+
+    test('should throw error when settings is not an object', async () => {
+      const configWithString = {
+        owner: 'my-org',
+        rules: [
+          {
+            selector: { repos: ['my-org/repo1'] },
+            settings: 'not an object'
+          }
+        ]
+      };
+
+      await expect(parseConfigWithRules(configWithString, mockOctokit)).rejects.toThrow(
+        'Rule 1: settings must be an object, got string'
+      );
+
+      const configWithArray = {
+        owner: 'my-org',
+        rules: [
+          {
+            selector: { repos: ['my-org/repo1'] },
+            settings: ['not', 'an', 'object']
+          }
+        ]
+      };
+
+      await expect(parseConfigWithRules(configWithArray, mockOctokit)).rejects.toThrow(
+        'Rule 1: settings must be an object, got array'
+      );
     });
   });
 
@@ -1683,7 +2319,7 @@ describe('Bulk GitHub Repository Settings Action', () => {
       await run();
 
       expect(mockCore.setFailed).toHaveBeenCalledWith(
-        'Action failed with error: At least one repository setting must be specified (or code-scanning must be true, or immutable-releases must be specified, or security settings must be specified, or topics must be provided, or dependabot-yml must be specified, or gitignore must be specified, or rulesets-file must be specified, or pull-request-template must be specified, or workflow-files must be specified, or autolinks-file must be specified, or copilot-instructions-md must be specified, or package-json-file with package-json-sync-scripts or package-json-sync-engines must be specified)'
+        'Action failed with error: At least one repository setting must be specified (or code-scanning must be true, or immutable-releases must be specified, or security settings must be specified, or topics must be provided, or dependabot-yml must be specified, or gitignore must be specified, or rulesets-file must be specified, or pull-request-template must be specified, or workflow-files must be specified, or autolinks-file must be specified, or copilot-instructions-md must be specified, or codeowners must be specified, or package-json-file with package-json-sync-scripts or package-json-sync-engines must be specified)'
       );
     });
 
@@ -2529,6 +3165,49 @@ describe('Bulk GitHub Repository Settings Action', () => {
       const repoRow = tableCall.find(row => row[0] === 'owner/repo1');
       expect(repoRow).toBeDefined();
       expect(repoRow[2]).toContain('copilot-instructions');
+    });
+
+    test('should handle summary table with codeowners sync changes', async () => {
+      mockCore.getInput.mockImplementation(name => {
+        const inputs = {
+          'github-token': 'test-token',
+          repositories: 'owner/repo1',
+          codeowners: 'CODEOWNERS'
+        };
+        return inputs[name] || '';
+      });
+
+      setMockFileContent('# CODEOWNERS\n* @owner/team');
+      mockOctokit.rest.repos.get.mockResolvedValue({
+        data: {
+          default_branch: 'main',
+          permissions: { admin: true },
+          allow_squash_merge: true,
+          allow_merge_commit: true,
+          allow_rebase_merge: true,
+          delete_branch_on_merge: false,
+          allow_auto_merge: false,
+          allow_update_branch: false
+        }
+      });
+      mockOctokit.rest.repos.getContent.mockRejectedValue({ status: 404 });
+      mockOctokit.rest.pulls.list.mockResolvedValue({ data: [] });
+      mockOctokit.rest.git.getRef
+        .mockRejectedValueOnce({ status: 404 })
+        .mockResolvedValueOnce({ data: { object: { sha: 'abc123' } } });
+      mockOctokit.rest.git.createRef.mockResolvedValue({});
+      mockOctokit.rest.repos.createOrUpdateFileContents.mockResolvedValue({});
+      mockOctokit.rest.pulls.create.mockResolvedValue({
+        data: { number: 46, html_url: 'https://github.com/owner/repo1/pull/46' }
+      });
+
+      await run();
+
+      expect(mockCore.summary.addTable).toHaveBeenCalled();
+      const tableCall = mockCore.summary.addTable.mock.calls[0][0];
+      const repoRow = tableCall.find(row => row[0] === 'owner/repo1');
+      expect(repoRow).toBeDefined();
+      expect(repoRow[2]).toContain('CODEOWNERS');
     });
 
     test('should handle summary table with package.json sync changes', async () => {
@@ -6147,6 +6826,551 @@ describe('Bulk GitHub Repository Settings Action', () => {
     });
   });
 
+  describe('syncCodeowners', () => {
+    beforeEach(() => {
+      jest.clearAllMocks();
+      mockOctokit.rest.repos.get.mockClear();
+      mockOctokit.rest.repos.getContent.mockClear();
+      mockOctokit.rest.repos.createOrUpdateFileContents.mockClear();
+      mockOctokit.rest.git.getRef.mockClear();
+      mockOctokit.rest.git.createRef.mockClear();
+      mockOctokit.rest.git.updateRef.mockClear();
+      mockOctokit.rest.pulls.list.mockClear();
+      mockOctokit.rest.pulls.create.mockClear();
+      mockOctokit.rest.pulls.update.mockClear();
+    });
+
+    test('should create CODEOWNERS when it does not exist', async () => {
+      const testContent = '# CODEOWNERS\n* @owner/team';
+
+      setMockFileContent(testContent);
+
+      mockOctokit.rest.repos.get.mockResolvedValue({
+        data: {
+          default_branch: 'main'
+        }
+      });
+
+      // File does not exist
+      mockOctokit.rest.repos.getContent.mockRejectedValue({
+        status: 404
+      });
+
+      // No existing PRs
+      mockOctokit.rest.pulls.list.mockResolvedValue({
+        data: []
+      });
+
+      // Branch doesn't exist
+      mockOctokit.rest.git.getRef
+        .mockRejectedValueOnce({ status: 404 }) // Branch check
+        .mockResolvedValueOnce({
+          // Default branch ref
+          data: { object: { sha: 'abc123' } }
+        });
+
+      mockOctokit.rest.git.createRef.mockResolvedValue({});
+      mockOctokit.rest.repos.createOrUpdateFileContents.mockResolvedValue({});
+      mockOctokit.rest.pulls.create.mockResolvedValue({
+        data: {
+          number: 42,
+          html_url: 'https://github.com/owner/repo/pull/42'
+        }
+      });
+
+      const result = await syncCodeowners(
+        mockOctokit,
+        'owner/repo',
+        './CODEOWNERS',
+        '.github/CODEOWNERS',
+        'chore: add CODEOWNERS',
+        false
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.codeowners).toBe('created');
+      expect(result.prNumber).toBe(42);
+      expect(mockOctokit.rest.git.createRef).toHaveBeenCalled();
+      expect(mockOctokit.rest.repos.createOrUpdateFileContents).toHaveBeenCalledWith(
+        expect.objectContaining({
+          owner: 'owner',
+          repo: 'repo',
+          path: '.github/CODEOWNERS',
+          branch: 'codeowners-sync'
+        })
+      );
+      expect(mockOctokit.rest.pulls.create).toHaveBeenCalled();
+    });
+
+    test('should update CODEOWNERS when content differs', async () => {
+      const newContent = '# CODEOWNERS\n* @owner/new-team';
+      const oldContent = '# CODEOWNERS\n* @owner/old-team';
+
+      setMockFileContent(newContent);
+
+      mockOctokit.rest.repos.get.mockResolvedValue({
+        data: {
+          default_branch: 'main'
+        }
+      });
+
+      // File exists with different content
+      mockOctokit.rest.repos.getContent.mockResolvedValue({
+        data: {
+          sha: 'file-sha-456',
+          content: Buffer.from(oldContent).toString('base64')
+        }
+      });
+
+      // No existing PRs
+      mockOctokit.rest.pulls.list.mockResolvedValue({
+        data: []
+      });
+
+      // Branch doesn't exist
+      mockOctokit.rest.git.getRef.mockRejectedValueOnce({ status: 404 }).mockResolvedValueOnce({
+        data: { object: { sha: 'abc123' } }
+      });
+
+      mockOctokit.rest.git.createRef.mockResolvedValue({});
+      mockOctokit.rest.repos.createOrUpdateFileContents.mockResolvedValue({});
+      mockOctokit.rest.pulls.create.mockResolvedValue({
+        data: {
+          number: 43,
+          html_url: 'https://github.com/owner/repo/pull/43'
+        }
+      });
+
+      const result = await syncCodeowners(
+        mockOctokit,
+        'owner/repo',
+        './CODEOWNERS',
+        '.github/CODEOWNERS',
+        'chore: update CODEOWNERS',
+        false
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.codeowners).toBe('updated');
+      expect(result.prNumber).toBe(43);
+    });
+
+    test('should not create PR when content is unchanged', async () => {
+      const content = '# CODEOWNERS\n* @owner/team';
+
+      setMockFileContent(content);
+
+      mockOctokit.rest.repos.get.mockResolvedValue({
+        data: {
+          default_branch: 'main'
+        }
+      });
+
+      // File exists with same content
+      mockOctokit.rest.repos.getContent.mockResolvedValue({
+        data: {
+          sha: 'file-sha-789',
+          content: Buffer.from(content).toString('base64')
+        }
+      });
+
+      const result = await syncCodeowners(
+        mockOctokit,
+        'owner/repo',
+        './CODEOWNERS',
+        '.github/CODEOWNERS',
+        'chore: update CODEOWNERS',
+        false
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.codeowners).toBe('unchanged');
+      expect(result.message).toContain('already up to date');
+      expect(mockOctokit.rest.pulls.create).not.toHaveBeenCalled();
+    });
+
+    test('should support different target paths', async () => {
+      const testContent = '# CODEOWNERS\n* @owner/team';
+
+      setMockFileContent(testContent);
+
+      mockOctokit.rest.repos.get.mockResolvedValue({
+        data: {
+          default_branch: 'main'
+        }
+      });
+
+      mockOctokit.rest.repos.getContent.mockRejectedValue({
+        status: 404
+      });
+
+      mockOctokit.rest.pulls.list.mockResolvedValue({
+        data: []
+      });
+
+      mockOctokit.rest.git.getRef.mockRejectedValueOnce({ status: 404 }).mockResolvedValueOnce({
+        data: { object: { sha: 'abc123' } }
+      });
+
+      mockOctokit.rest.git.createRef.mockResolvedValue({});
+      mockOctokit.rest.repos.createOrUpdateFileContents.mockResolvedValue({});
+      mockOctokit.rest.pulls.create.mockResolvedValue({
+        data: {
+          number: 44,
+          html_url: 'https://github.com/owner/repo/pull/44'
+        }
+      });
+
+      // Test root CODEOWNERS path
+      const result = await syncCodeowners(
+        mockOctokit,
+        'owner/repo',
+        './CODEOWNERS',
+        'CODEOWNERS',
+        'chore: add CODEOWNERS',
+        false
+      );
+
+      expect(result.success).toBe(true);
+      expect(mockOctokit.rest.repos.createOrUpdateFileContents).toHaveBeenCalledWith(
+        expect.objectContaining({
+          path: 'CODEOWNERS'
+        })
+      );
+    });
+
+    test('should reject invalid target path', async () => {
+      const result = await syncCodeowners(
+        mockOctokit,
+        'owner/repo',
+        './CODEOWNERS',
+        '.github/invalid/CODEOWNERS',
+        'chore: add CODEOWNERS',
+        false
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('Invalid CODEOWNERS target path');
+      expect(result.error).toContain('.github/CODEOWNERS');
+      expect(result.error).toContain('CODEOWNERS');
+      expect(result.error).toContain('docs/CODEOWNERS');
+    });
+
+    test('should handle dry-run mode', async () => {
+      const newContent = '# CODEOWNERS\n* @owner/team';
+
+      setMockFileContent(newContent);
+
+      mockOctokit.rest.repos.get.mockResolvedValue({
+        data: {
+          default_branch: 'main'
+        }
+      });
+
+      mockOctokit.rest.repos.getContent.mockRejectedValue({
+        status: 404
+      });
+
+      mockOctokit.rest.pulls.list.mockResolvedValue({
+        data: []
+      });
+
+      const result = await syncCodeowners(
+        mockOctokit,
+        'owner/repo',
+        './CODEOWNERS',
+        '.github/CODEOWNERS',
+        'chore: add CODEOWNERS',
+        true // dry-run
+      );
+
+      expect(result.success).toBe(true);
+      expect(result.codeowners).toBe('would-create');
+      expect(result.dryRun).toBe(true);
+      expect(mockOctokit.rest.git.createRef).not.toHaveBeenCalled();
+      expect(mockOctokit.rest.repos.createOrUpdateFileContents).not.toHaveBeenCalled();
+      expect(mockOctokit.rest.pulls.create).not.toHaveBeenCalled();
+    });
+
+    test('should handle invalid repository format', async () => {
+      const result = await syncCodeowners(
+        mockOctokit,
+        'invalid-repo-format',
+        './CODEOWNERS',
+        '.github/CODEOWNERS',
+        'chore: update CODEOWNERS',
+        false
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('Invalid repository format');
+    });
+
+    test('should handle missing CODEOWNERS file', async () => {
+      mockFs.readFileSync.mockImplementation(() => {
+        throw new Error('ENOENT: no such file or directory');
+      });
+
+      const result = await syncCodeowners(
+        mockOctokit,
+        'owner/repo',
+        './nonexistent-codeowners',
+        '.github/CODEOWNERS',
+        'chore: update CODEOWNERS',
+        false
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('Failed to read file at');
+      expect(result.error).toContain('CODEOWNERS');
+    });
+
+    test('should handle API errors', async () => {
+      setMockFileContent('# CODEOWNERS\n* @owner/team');
+
+      mockOctokit.rest.repos.get.mockRejectedValue(new Error('API rate limit exceeded'));
+
+      const result = await syncCodeowners(
+        mockOctokit,
+        'owner/repo',
+        './CODEOWNERS',
+        '.github/CODEOWNERS',
+        'chore: update CODEOWNERS',
+        false
+      );
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('Failed to sync CODEOWNERS');
+    });
+
+    test('should apply template variables when provided', async () => {
+      const templateContent = '* {{default_team}}\n/src/ {{code_reviewers}}';
+
+      setMockFileContent(templateContent);
+
+      mockOctokit.rest.repos.get.mockResolvedValue({
+        data: { default_branch: 'main' }
+      });
+
+      // File does not exist
+      mockOctokit.rest.repos.getContent.mockRejectedValue({ status: 404 });
+
+      // No existing PRs
+      mockOctokit.rest.pulls.list.mockResolvedValue({ data: [] });
+
+      // Branch doesn't exist
+      mockOctokit.rest.git.getRef
+        .mockRejectedValueOnce({ status: 404 })
+        .mockResolvedValueOnce({ data: { object: { sha: 'abc123' } } });
+
+      mockOctokit.rest.git.createRef.mockResolvedValue({});
+      mockOctokit.rest.repos.createOrUpdateFileContents.mockResolvedValue({});
+      mockOctokit.rest.pulls.create.mockResolvedValue({
+        data: { number: 42, html_url: 'https://github.com/owner/repo/pull/42' }
+      });
+
+      const result = await syncCodeowners(
+        mockOctokit,
+        'owner/repo',
+        './CODEOWNERS.template',
+        '.github/CODEOWNERS',
+        'chore: update CODEOWNERS',
+        false,
+        { default_team: '@org/team-a', code_reviewers: '@org/leads' }
+      );
+
+      expect(result.success).toBe(true);
+
+      // Verify the content was transformed
+      const createFileCall = mockOctokit.rest.repos.createOrUpdateFileContents.mock.calls[0][0];
+      const committedContent = Buffer.from(createFileCall.content, 'base64').toString('utf8');
+      expect(committedContent).toContain('@org/team-a');
+      expect(committedContent).toContain('@org/leads');
+      expect(committedContent).not.toContain('{{default_team}}');
+      expect(committedContent).not.toContain('{{code_reviewers}}');
+    });
+
+    test('should handle template variables with whitespace', async () => {
+      const templateContent = '* {{ default_team }}\n/src/ {{  code_reviewers  }}';
+
+      setMockFileContent(templateContent);
+
+      mockOctokit.rest.repos.get.mockResolvedValue({
+        data: { default_branch: 'main' }
+      });
+
+      mockOctokit.rest.repos.getContent.mockRejectedValue({ status: 404 });
+      mockOctokit.rest.pulls.list.mockResolvedValue({ data: [] });
+      mockOctokit.rest.git.getRef
+        .mockRejectedValueOnce({ status: 404 })
+        .mockResolvedValueOnce({ data: { object: { sha: 'abc123' } } });
+
+      mockOctokit.rest.git.createRef.mockResolvedValue({});
+      mockOctokit.rest.repos.createOrUpdateFileContents.mockResolvedValue({});
+      mockOctokit.rest.pulls.create.mockResolvedValue({
+        data: { number: 42, html_url: 'https://github.com/owner/repo/pull/42' }
+      });
+
+      const result = await syncCodeowners(
+        mockOctokit,
+        'owner/repo',
+        './CODEOWNERS.template',
+        '.github/CODEOWNERS',
+        'chore: update CODEOWNERS',
+        false,
+        { default_team: '@org/team-a', code_reviewers: '@org/leads' }
+      );
+
+      expect(result.success).toBe(true);
+
+      const createFileCall = mockOctokit.rest.repos.createOrUpdateFileContents.mock.calls[0][0];
+      const committedContent = Buffer.from(createFileCall.content, 'base64').toString('utf8');
+      expect(committedContent).toContain('@org/team-a');
+      expect(committedContent).toContain('@org/leads');
+    });
+
+    test('should not transform content when no template variables provided', async () => {
+      const staticContent = '* @org/team-a\n/src/ @org/leads';
+
+      setMockFileContent(staticContent);
+
+      mockOctokit.rest.repos.get.mockResolvedValue({
+        data: { default_branch: 'main' }
+      });
+
+      mockOctokit.rest.repos.getContent.mockRejectedValue({ status: 404 });
+      mockOctokit.rest.pulls.list.mockResolvedValue({ data: [] });
+      mockOctokit.rest.git.getRef
+        .mockRejectedValueOnce({ status: 404 })
+        .mockResolvedValueOnce({ data: { object: { sha: 'abc123' } } });
+
+      mockOctokit.rest.git.createRef.mockResolvedValue({});
+      mockOctokit.rest.repos.createOrUpdateFileContents.mockResolvedValue({});
+      mockOctokit.rest.pulls.create.mockResolvedValue({
+        data: { number: 42, html_url: 'https://github.com/owner/repo/pull/42' }
+      });
+
+      // Call without template variables
+      const result = await syncCodeowners(
+        mockOctokit,
+        'owner/repo',
+        './CODEOWNERS',
+        '.github/CODEOWNERS',
+        'chore: update CODEOWNERS',
+        false
+      );
+
+      expect(result.success).toBe(true);
+
+      const createFileCall = mockOctokit.rest.repos.createOrUpdateFileContents.mock.calls[0][0];
+      const committedContent = Buffer.from(createFileCall.content, 'base64').toString('utf8');
+      expect(committedContent).toContain('@org/team-a');
+      expect(committedContent).toContain('@org/leads');
+    });
+  });
+
+  describe('replaceTemplateVariables', () => {
+    test('should replace single variable', () => {
+      const content = '* {{team}}';
+      const result = replaceTemplateVariables(content, { team: '@org/my-team' });
+      expect(result).toBe('* @org/my-team');
+    });
+
+    test('should replace multiple variables', () => {
+      const content = '* {{default_team}}\n/src/ {{code_team}}\n/docs/ {{docs_team}}';
+      const result = replaceTemplateVariables(content, {
+        default_team: '@org/team-a',
+        code_team: '@org/devs',
+        docs_team: '@org/writers'
+      });
+      expect(result).toBe('* @org/team-a\n/src/ @org/devs\n/docs/ @org/writers');
+    });
+
+    test('should replace same variable multiple times', () => {
+      const content = '* {{team}}\n/src/ {{team}}\n/api/ {{team}}';
+      const result = replaceTemplateVariables(content, { team: '@org/my-team' });
+      expect(result).toBe('* @org/my-team\n/src/ @org/my-team\n/api/ @org/my-team');
+    });
+
+    test('should handle whitespace in variable brackets', () => {
+      const content = '* {{ team }}\n/src/ {{  team  }}';
+      const result = replaceTemplateVariables(content, { team: '@org/my-team' });
+      expect(result).toBe('* @org/my-team\n/src/ @org/my-team');
+    });
+
+    test('should handle variable names with regex special characters', () => {
+      // Variable names with special regex chars should be escaped properly
+      const content = '* {{team.name}}\n/src/ {{team[1]}}';
+      const result = replaceTemplateVariables(content, {
+        'team.name': '@org/dotted-team',
+        'team[1]': '@org/bracketed-team'
+      });
+      expect(result).toBe('* @org/dotted-team\n/src/ @org/bracketed-team');
+    });
+
+    test('should handle variable values with special replacement patterns', () => {
+      // Values with $&, $1, $$ etc. should be treated as literal strings
+      const content = '* {{team}}';
+      const result = replaceTemplateVariables(content, { team: '$& Team $1 $$' });
+      expect(result).toBe('* $& Team $1 $$');
+    });
+
+    test('should return original content when vars is null', () => {
+      const content = '* {{team}}';
+      const result = replaceTemplateVariables(content, null);
+      expect(result).toBe('* {{team}}');
+    });
+
+    test('should return original content when vars is undefined', () => {
+      const content = '* {{team}}';
+      const result = replaceTemplateVariables(content, undefined);
+      expect(result).toBe('* {{team}}');
+    });
+
+    test('should return original content when vars is empty object', () => {
+      const content = '* {{team}}';
+      const result = replaceTemplateVariables(content, {});
+      expect(result).toBe('* {{team}}');
+    });
+
+    test('should not replace undefined variables', () => {
+      const content = '* {{team}}\n/src/ {{other}}';
+      const result = replaceTemplateVariables(content, { team: '@org/my-team' });
+      expect(result).toBe('* @org/my-team\n/src/ {{other}}');
+    });
+
+    test('should handle complex CODEOWNERS content', () => {
+      const content = `# CODEOWNERS file
+# Default owners for everything
+* {{default_team}}
+
+# Frontend code
+/src/components/ {{frontend_team}}
+/src/styles/ {{frontend_team}}
+
+# Backend code
+/src/api/ {{backend_team}}
+/src/services/ {{backend_team}}
+
+# Documentation
+/docs/ {{docs_team}}
+*.md {{docs_team}}`;
+
+      const result = replaceTemplateVariables(content, {
+        default_team: '@org/all-devs',
+        frontend_team: '@org/frontend @org/ux-team',
+        backend_team: '@org/backend',
+        docs_team: '@org/tech-writers'
+      });
+
+      expect(result).toContain('* @org/all-devs');
+      expect(result).toContain('/src/components/ @org/frontend @org/ux-team');
+      expect(result).toContain('/src/api/ @org/backend');
+      expect(result).toContain('/docs/ @org/tech-writers');
+      expect(result).not.toContain('{{');
+    });
+  });
+
   describe('syncPackageJson', () => {
     beforeEach(() => {
       jest.clearAllMocks();
@@ -6663,6 +7887,407 @@ describe('Bulk GitHub Repository Settings Action', () => {
 
       expect(result.success).toBe(false);
       expect(result.error).toContain('Failed to sync package.json');
+    });
+  });
+
+  describe('pr-up-to-date status handling in summary', () => {
+    test('should show pending merge message for dependabot when PR is up-to-date', async () => {
+      mockCore.getInput.mockImplementation(name => {
+        const inputs = {
+          'github-token': 'test-token',
+          repositories: 'owner/repo1',
+          'dependabot-yml': './dependabot.yml'
+        };
+        return inputs[name] || '';
+      });
+
+      // Mock repo settings
+      mockOctokit.rest.repos.get.mockResolvedValue({
+        data: {
+          default_branch: 'main',
+          permissions: { admin: true },
+          allow_squash_merge: true,
+          allow_merge_commit: true,
+          allow_rebase_merge: true,
+          delete_branch_on_merge: false,
+          allow_auto_merge: false,
+          allow_update_branch: false
+        }
+      });
+
+      // Mock dependabot.yml source content
+      const sourceContent = 'version: 2\nupdates: []';
+      setMockFileContent(sourceContent);
+
+      // For pr-up-to-date: default branch has DIFFERENT content, PR branch has SAME content
+      const oldDefaultBranchContent = 'version: 2\nupdates: [old]';
+      mockOctokit.rest.repos.getContent.mockImplementation(async ({ ref }) => {
+        if (ref === 'dependabot-yml-sync') {
+          // PR branch has the latest content (matches source)
+          return {
+            data: {
+              content: Buffer.from(sourceContent).toString('base64'),
+              sha: 'pr-branch-sha'
+            }
+          };
+        }
+        // Default branch (main) has old/different content
+        return {
+          data: {
+            content: Buffer.from(oldDefaultBranchContent).toString('base64'),
+            sha: 'default-branch-sha'
+          }
+        };
+      });
+
+      // Mock existing open PR for this branch
+      mockOctokit.rest.pulls.list.mockResolvedValue({
+        data: [
+          {
+            number: 42,
+            html_url: 'https://github.com/owner/repo1/pull/42'
+          }
+        ]
+      });
+
+      await run();
+
+      // Verify the summary table shows the pending merge message
+      expect(mockCore.summary.addTable).toHaveBeenCalled();
+      const tableCall = mockCore.summary.addTable.mock.calls[0][0];
+      const repoRow = tableCall.find(row => row[0] === 'owner/repo1');
+      expect(repoRow).toBeDefined();
+      expect(repoRow[2]).toContain(
+        'dependabot.yml [PR #42](https://github.com/owner/repo1/pull/42) up-to-date (pending merge)'
+      );
+    });
+
+    test('should show pending merge message for workflow files when PR is up-to-date', async () => {
+      mockCore.getInput.mockImplementation(name => {
+        const inputs = {
+          'github-token': 'test-token',
+          repositories: 'owner/repo1',
+          'workflow-files': './workflow.yml'
+        };
+        return inputs[name] || '';
+      });
+
+      // Mock repo settings
+      mockOctokit.rest.repos.get.mockResolvedValue({
+        data: {
+          default_branch: 'main',
+          permissions: { admin: true },
+          allow_squash_merge: true,
+          allow_merge_commit: true,
+          allow_rebase_merge: true,
+          delete_branch_on_merge: false,
+          allow_auto_merge: false,
+          allow_update_branch: false
+        }
+      });
+
+      // Mock workflow file source content
+      const sourceContent = 'name: test\non: push';
+      setMockFileContent(sourceContent);
+
+      // For pr-up-to-date: default branch has DIFFERENT content, PR branch has SAME content
+      const oldDefaultBranchContent = 'name: old\non: push';
+      mockOctokit.rest.repos.getContent.mockImplementation(async ({ ref }) => {
+        if (ref === 'workflow-files-sync') {
+          // PR branch has the latest content (matches source)
+          return {
+            data: {
+              content: Buffer.from(sourceContent).toString('base64'),
+              sha: 'pr-branch-sha'
+            }
+          };
+        }
+        // Default branch (main) has old/different content
+        return {
+          data: {
+            content: Buffer.from(oldDefaultBranchContent).toString('base64'),
+            sha: 'default-branch-sha'
+          }
+        };
+      });
+
+      // Mock existing open PR for this branch
+      mockOctokit.rest.pulls.list.mockResolvedValue({
+        data: [
+          {
+            number: 99,
+            html_url: 'https://github.com/owner/repo1/pull/99'
+          }
+        ]
+      });
+
+      await run();
+
+      // Verify the summary table shows the pending merge message
+      expect(mockCore.summary.addTable).toHaveBeenCalled();
+      const tableCall = mockCore.summary.addTable.mock.calls[0][0];
+      const repoRow = tableCall.find(row => row[0] === 'owner/repo1');
+      expect(repoRow).toBeDefined();
+      expect(repoRow[2]).toContain(
+        'workflow files [PR #99](https://github.com/owner/repo1/pull/99) up-to-date (pending merge)'
+      );
+    });
+
+    test('should identify pr-up-to-date as reportable change (not no-changes-needed)', async () => {
+      mockCore.getInput.mockImplementation(name => {
+        const inputs = {
+          'github-token': 'test-token',
+          repositories: 'owner/repo1',
+          'dependabot-yml': './dependabot.yml'
+        };
+        return inputs[name] || '';
+      });
+
+      // Mock repo settings - all match so no settings changes
+      mockOctokit.rest.repos.get.mockResolvedValue({
+        data: {
+          default_branch: 'main',
+          permissions: { admin: true },
+          allow_squash_merge: true,
+          allow_merge_commit: true,
+          allow_rebase_merge: true,
+          delete_branch_on_merge: false,
+          allow_auto_merge: false,
+          allow_update_branch: false
+        }
+      });
+
+      // Mock dependabot.yml source content
+      const sourceContent = 'version: 2\nupdates: []';
+      setMockFileContent(sourceContent);
+
+      // For pr-up-to-date: default branch has DIFFERENT content, PR branch has SAME content
+      const oldDefaultBranchContent = 'version: 2\nupdates: [old]';
+      mockOctokit.rest.repos.getContent.mockImplementation(async ({ ref }) => {
+        if (ref === 'dependabot-yml-sync') {
+          // PR branch has the latest content (matches source)
+          return {
+            data: {
+              content: Buffer.from(sourceContent).toString('base64'),
+              sha: 'pr-branch-sha'
+            }
+          };
+        }
+        // Default branch (main) has old/different content
+        return {
+          data: {
+            content: Buffer.from(oldDefaultBranchContent).toString('base64'),
+            sha: 'default-branch-sha'
+          }
+        };
+      });
+
+      // Mock existing open PR with same content (pr-up-to-date scenario)
+      mockOctokit.rest.pulls.list.mockResolvedValue({
+        data: [
+          {
+            number: 42,
+            html_url: 'https://github.com/owner/repo1/pull/42'
+          }
+        ]
+      });
+
+      await run();
+
+      // The summary should NOT show "No changes needed" - it should show the pending PR
+      expect(mockCore.summary.addTable).toHaveBeenCalled();
+      const tableCall = mockCore.summary.addTable.mock.calls[0][0];
+      const repoRow = tableCall.find(row => row[0] === 'owner/repo1');
+      expect(repoRow).toBeDefined();
+      // Should show the pending merge message, NOT "No changes needed"
+      expect(repoRow[2]).not.toBe('No changes needed');
+      expect(repoRow[2]).toContain('pending merge');
+    });
+  });
+
+  describe('changed/unchanged counts and summary status', () => {
+    test('should output changed and unchanged counts when some repos have changes', async () => {
+      mockCore.getInput.mockImplementation(name => {
+        const inputs = {
+          'github-token': 'test-token',
+          repositories: 'owner/repo1,owner/repo2',
+          'allow-squash-merge': 'true'
+        };
+        return inputs[name] || '';
+      });
+
+      // repo1: has a change (squash merge differs)
+      mockOctokit.rest.repos.get.mockResolvedValueOnce({
+        data: {
+          default_branch: 'main',
+          permissions: { admin: true },
+          allow_squash_merge: false,
+          allow_merge_commit: true,
+          allow_rebase_merge: true,
+          delete_branch_on_merge: false,
+          allow_auto_merge: false,
+          allow_update_branch: false
+        }
+      });
+      // repo2: no change (squash merge already true)
+      mockOctokit.rest.repos.get.mockResolvedValueOnce({
+        data: {
+          default_branch: 'main',
+          permissions: { admin: true },
+          allow_squash_merge: true,
+          allow_merge_commit: true,
+          allow_rebase_merge: true,
+          delete_branch_on_merge: false,
+          allow_auto_merge: false,
+          allow_update_branch: false
+        }
+      });
+
+      mockOctokit.rest.repos.update.mockResolvedValue({});
+
+      await run();
+
+      expect(mockCore.setOutput).toHaveBeenCalledWith('updated-repositories', '2');
+      expect(mockCore.setOutput).toHaveBeenCalledWith('changed-repositories', '1');
+      expect(mockCore.setOutput).toHaveBeenCalledWith('unchanged-repositories', '1');
+      expect(mockCore.setOutput).toHaveBeenCalledWith('failed-repositories', '0');
+    });
+
+    test('should show Changed status in summary table for repos with changes', async () => {
+      mockCore.getInput.mockImplementation(name => {
+        const inputs = {
+          'github-token': 'test-token',
+          repositories: 'owner/repo1,owner/repo2',
+          'allow-squash-merge': 'true'
+        };
+        return inputs[name] || '';
+      });
+
+      // repo1: has a change
+      mockOctokit.rest.repos.get.mockResolvedValueOnce({
+        data: {
+          default_branch: 'main',
+          permissions: { admin: true },
+          allow_squash_merge: false,
+          allow_merge_commit: true,
+          allow_rebase_merge: true,
+          delete_branch_on_merge: false,
+          allow_auto_merge: false,
+          allow_update_branch: false
+        }
+      });
+      // repo2: no change
+      mockOctokit.rest.repos.get.mockResolvedValueOnce({
+        data: {
+          default_branch: 'main',
+          permissions: { admin: true },
+          allow_squash_merge: true,
+          allow_merge_commit: true,
+          allow_rebase_merge: true,
+          delete_branch_on_merge: false,
+          allow_auto_merge: false,
+          allow_update_branch: false
+        }
+      });
+
+      mockOctokit.rest.repos.update.mockResolvedValue({});
+
+      await run();
+
+      expect(mockCore.summary.addTable).toHaveBeenCalled();
+      const tableCall = mockCore.summary.addTable.mock.calls[0][0];
+      const repo1Row = tableCall.find(row => row[0] === 'owner/repo1');
+      const repo2Row = tableCall.find(row => row[0] === 'owner/repo2');
+
+      expect(repo1Row[1]).toBe('\u2705 Changed');
+      expect(repo2Row[1]).toBe('\u2796 No changes');
+    });
+
+    test('should output correct counts in dry-run mode', async () => {
+      mockCore.getInput.mockImplementation(name => {
+        const inputs = {
+          'github-token': 'test-token',
+          repositories: 'owner/repo1,owner/repo2',
+          'allow-squash-merge': 'true',
+          'dry-run': 'true'
+        };
+        return inputs[name] || '';
+      });
+
+      // repo1: would change
+      mockOctokit.rest.repos.get.mockResolvedValueOnce({
+        data: {
+          default_branch: 'main',
+          permissions: { admin: true },
+          allow_squash_merge: false,
+          allow_merge_commit: true,
+          allow_rebase_merge: true,
+          delete_branch_on_merge: false,
+          allow_auto_merge: false,
+          allow_update_branch: false
+        }
+      });
+      // repo2: no change needed
+      mockOctokit.rest.repos.get.mockResolvedValueOnce({
+        data: {
+          default_branch: 'main',
+          permissions: { admin: true },
+          allow_squash_merge: true,
+          allow_merge_commit: true,
+          allow_rebase_merge: true,
+          delete_branch_on_merge: false,
+          allow_auto_merge: false,
+          allow_update_branch: false
+        }
+      });
+
+      await run();
+
+      expect(mockCore.setOutput).toHaveBeenCalledWith('changed-repositories', '1');
+      expect(mockCore.setOutput).toHaveBeenCalledWith('unchanged-repositories', '1');
+
+      // Verify summary table status strings in dry-run
+      expect(mockCore.summary.addTable).toHaveBeenCalled();
+      const tableCall = mockCore.summary.addTable.mock.calls[0][0];
+      const repo1Row = tableCall.find(row => row[0] === 'owner/repo1');
+      const repo2Row = tableCall.find(row => row[0] === 'owner/repo2');
+
+      expect(repo1Row[1]).toBe('\u2705 Changed');
+      expect(repo2Row[1]).toBe('\u2796 No changes');
+    });
+
+    test('should show all repos as unchanged when no changes needed', async () => {
+      mockCore.getInput.mockImplementation(name => {
+        const inputs = {
+          'github-token': 'test-token',
+          repositories: 'owner/repo1',
+          'allow-squash-merge': 'true'
+        };
+        return inputs[name] || '';
+      });
+
+      mockOctokit.rest.repos.get.mockResolvedValue({
+        data: {
+          default_branch: 'main',
+          permissions: { admin: true },
+          allow_squash_merge: true,
+          allow_merge_commit: true,
+          allow_rebase_merge: true,
+          delete_branch_on_merge: false,
+          allow_auto_merge: false,
+          allow_update_branch: false
+        }
+      });
+
+      await run();
+
+      expect(mockCore.setOutput).toHaveBeenCalledWith('changed-repositories', '0');
+      expect(mockCore.setOutput).toHaveBeenCalledWith('unchanged-repositories', '1');
+
+      const tableCall = mockCore.summary.addTable.mock.calls[0][0];
+      const repoRow = tableCall.find(row => row[0] === 'owner/repo1');
+      expect(repoRow[1]).toBe('\u2796 No changes');
+      expect(repoRow[2]).toBe('No changes needed');
     });
   });
 

@@ -45,7 +45,8 @@ import * as yaml from 'js-yaml';
  */
 function getKnownRepoConfigKeys() {
   // 'repo' is always valid as it's the repository identifier in YAML config
-  const keys = new Set(['repo']);
+  // 'codeowners-vars' is YAML-only config for template variables (no action input)
+  const keys = new Set(['repo', 'codeowners-vars']);
 
   try {
     // Get the directory where this script is located
@@ -116,6 +117,41 @@ function validateRepoConfig(repoConfig, repoName) {
 }
 
 /**
+ * Escape special regex characters in a string.
+ * @param {string} str - String to escape
+ * @returns {string} Escaped string safe for use in RegExp
+ */
+function escapeRegExp(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Replace template variables in content with provided values.
+ * Template variables use the format {{variable_name}}.
+ * @param {string} content - Content with template variables
+ * @param {Object} vars - Object with variable names and values
+ * @returns {string} Content with variables replaced
+ */
+export function replaceTemplateVariables(content, vars) {
+  if (!vars || typeof vars !== 'object' || Object.keys(vars).length === 0) {
+    return content;
+  }
+
+  let result = content;
+  for (const [varName, varValue] of Object.entries(vars)) {
+    // Replace all occurrences of {{varName}} with varValue
+    // Use a regex to match the exact variable name with optional whitespace
+    // Escape varName to handle any special regex characters safely
+    const escapedVarName = escapeRegExp(varName);
+    const regex = new RegExp(`\\{\\{\\s*${escapedVarName}\\s*\\}\\}`, 'g');
+    // Use a function for replacement to avoid special replacement patterns ($&, $1, etc.)
+    result = result.replace(regex, () => String(varValue));
+  }
+
+  return result;
+}
+
+/**
  * Get input value (works reliably in both GitHub Actions and local environments)
  * @param {string} name - Input name (with dashes)
  * @returns {string} Input value
@@ -145,24 +181,364 @@ function getBooleanInput(name) {
 }
 
 /**
+ * Get all repositories with their custom property values for an organization
+ * Uses the efficient org-level API: GET /orgs/{org}/properties/values
+ * @param {Octokit} octokit - Octokit instance
+ * @param {string} owner - Organization name
+ * @returns {Promise<Array>} Array of repository objects with their properties
+ */
+async function getOrgRepositoriesWithProperties(octokit, owner) {
+  const allRepos = [];
+  const perPage = 100;
+  let page = 1;
+  let hasMore = true;
+
+  while (hasMore) {
+    const response = await octokit.request('GET /orgs/{org}/properties/values', {
+      org: owner,
+      per_page: perPage,
+      page
+    });
+
+    allRepos.push(...response.data);
+
+    // Stop when we get fewer results than requested OR an empty page
+    // (handles exact multiples of perPage)
+    if (response.data.length === 0 || response.data.length < perPage) {
+      hasMore = false;
+    } else {
+      page++;
+    }
+  }
+
+  return allRepos;
+}
+
+/**
+ * Filter repositories by custom property value
+ * Uses the efficient org-level API that returns all repos with properties in one call
+ * @param {Octokit} octokit - Octokit instance
+ * @param {string} owner - Owner (organization) name
+ * @param {string} propertyName - Name of the custom property to filter by
+ * @param {Array<string>} propertyValues - Array of property values to match
+ * @returns {Promise<Array>} Array of repository objects matching the custom property
+ */
+export async function filterRepositoriesByCustomProperty(octokit, owner, propertyName, propertyValues) {
+  if (!owner) {
+    throw new Error('Owner (organization) must be specified when filtering by custom property');
+  }
+
+  if (!propertyName) {
+    throw new Error('Custom property name must be specified');
+  }
+
+  if (!propertyValues || propertyValues.length === 0) {
+    throw new Error('At least one custom property value must be specified');
+  }
+
+  try {
+    core.info(
+      `Fetching repositories with custom property "${propertyName}" matching values: ${propertyValues.join(', ')}...`
+    );
+
+    // Verify this is an organization (custom properties are org-only)
+    try {
+      await octokit.rest.orgs.get({ org: owner });
+    } catch (orgError) {
+      // Treat only 404 as "not an organization"; rethrow other errors so callers
+      // can see permission or server issues instead of a misleading message.
+      if (orgError && typeof orgError === 'object' && 'status' in orgError && orgError.status === 404) {
+        throw new Error('Custom properties are only available for organizations, not for user accounts');
+      }
+      throw orgError;
+    }
+
+    // Use the efficient org-level API that returns ALL repos with their properties
+    // This is a single paginated call instead of N+1 calls (one per repo)
+    const reposWithProperties = await getOrgRepositoriesWithProperties(octokit, owner);
+
+    core.info(`Found ${reposWithProperties.length} total repositories, filtering by custom property...`);
+
+    // Filter repositories by checking their custom properties
+    const matchedRepos = reposWithProperties
+      .filter(repo => {
+        // Check if the repository has the specified custom property with any of the matching values
+        return repo.properties?.some(prop => {
+          if (prop.property_name === propertyName) {
+            // Convert property value to string for comparison
+            const propValue = String(prop.value);
+            return propertyValues.includes(propValue);
+          }
+          return false;
+        });
+      })
+      .map(repo => ({ repo: repo.repository_full_name }));
+
+    core.info(`Found ${matchedRepos.length} repositories matching custom property filter`);
+    return matchedRepos;
+  } catch (error) {
+    throw new Error(`Failed to filter repositories by custom property: ${error.message}`);
+  }
+}
+
+/**
+ * Parse a rules-based configuration file and return repositories with merged settings
+ * @param {Object} config - Parsed YAML config object with rules array
+ * @param {Octokit} octokit - Octokit instance
+ * @returns {Promise<Array>} Array of repository objects with merged settings from matching rules
+ */
+export async function parseConfigWithRules(config, octokit) {
+  if (!config.rules || !Array.isArray(config.rules)) {
+    throw new Error('Configuration must contain a "rules" array');
+  }
+
+  const owner = config.owner;
+  if (!owner) {
+    throw new Error('Configuration must specify an "owner" for rules-based configuration');
+  }
+
+  // Cache for org repos with properties (to avoid refetching for each rule)
+  // Cache for org verification and repo properties fetch
+  let cachedReposWithProperties = null;
+  let orgVerified = false;
+
+  // Map to track repositories and their merged settings
+  // Key: repo full name, Value: merged settings object
+  const repoSettingsMap = new Map();
+
+  core.info(`Processing ${config.rules.length} rule(s)...`);
+
+  for (let i = 0; i < config.rules.length; i++) {
+    const rule = config.rules[i];
+
+    if (!rule.selector) {
+      throw new Error(`Rule ${i + 1} must have a "selector" property`);
+    }
+
+    if (!rule.settings) {
+      core.warning(`Rule ${i + 1} has no settings, skipping`);
+      continue;
+    }
+
+    // Validate settings is a plain object
+    if (typeof rule.settings !== 'object' || Array.isArray(rule.settings)) {
+      throw new Error(
+        `Rule ${i + 1}: settings must be an object, got ${Array.isArray(rule.settings) ? 'array' : typeof rule.settings}`
+      );
+    }
+
+    let matchedRepos = [];
+
+    // Handle custom-property selector
+    if (rule.selector['custom-property']) {
+      const propConfig = rule.selector['custom-property'];
+      const propertyName = propConfig.name;
+
+      // Validate name is a non-empty string
+      if (typeof propertyName !== 'string' || propertyName.trim() === '') {
+        throw new Error(
+          `Rule ${i + 1}: custom-property selector "name" must be a non-empty string (got ${typeof propertyName})`
+        );
+      }
+
+      // Handle both array and scalar values, normalize to strings
+      const rawValues = propConfig.values ?? (propConfig.value !== undefined ? propConfig.value : undefined);
+      let propertyValues;
+
+      if (rawValues === undefined || rawValues === null) {
+        propertyValues = [];
+      } else if (Array.isArray(rawValues)) {
+        propertyValues = rawValues;
+      } else if (['string', 'number', 'boolean'].includes(typeof rawValues)) {
+        // Allow scalar shorthand: values: production
+        propertyValues = [rawValues];
+      } else {
+        throw new Error(
+          `Rule ${i + 1}: custom-property "values" must be a scalar or an array of scalars (got ${typeof rawValues})`
+        );
+      }
+
+      // Normalize all values to strings (YAML can parse numbers/booleans)
+      propertyValues = propertyValues.map(v => String(v));
+
+      if (propertyValues.length === 0) {
+        throw new Error(`Rule ${i + 1}: custom-property selector must have "value" or "values" property`);
+      }
+
+      core.info(`Rule ${i + 1}: Filtering by custom property "${propertyName}" = [${propertyValues.join(', ')}]`);
+
+      // Verify this is an organization (only once)
+      if (!orgVerified) {
+        try {
+          await octokit.rest.orgs.get({ org: owner });
+          orgVerified = true;
+        } catch (error) {
+          // Distinguish "not an org" (404) from permission/transient errors
+          if (error && typeof error === 'object' && 'status' in error && error.status === 404) {
+            throw new Error('Custom properties are only available for organizations, not for user accounts');
+          }
+          // Surface the original error for non-404 failures (e.g. 403/5xx)
+          throw error;
+        }
+      }
+
+      // Fetch org repos with properties (cached)
+      if (!cachedReposWithProperties) {
+        core.info(`Fetching all repositories with custom properties for ${owner}...`);
+        cachedReposWithProperties = await getOrgRepositoriesWithProperties(octokit, owner);
+        core.info(`Found ${cachedReposWithProperties.length} total repositories`);
+      }
+
+      // Filter by property
+      matchedRepos = cachedReposWithProperties
+        .filter(repo => {
+          return repo.properties?.some(prop => {
+            if (prop.property_name === propertyName) {
+              const propValue = String(prop.value);
+              return propertyValues.includes(propValue);
+            }
+            return false;
+          });
+        })
+        .map(repo => repo.repository_full_name);
+
+      core.info(`  → Matched ${matchedRepos.length} repositories`);
+    }
+    // Handle repos selector (explicit list)
+    else if (rule.selector.repos && Array.isArray(rule.selector.repos)) {
+      // Validate that all entries are non-empty strings
+      for (let j = 0; j < rule.selector.repos.length; j++) {
+        const repo = rule.selector.repos[j];
+        if (typeof repo !== 'string' || repo.trim() === '') {
+          throw new Error(
+            `Rule ${i + 1}: repos selector entry ${j + 1} must be a non-empty string, got: ${typeof repo}`
+          );
+        }
+      }
+      matchedRepos = rule.selector.repos.map(repo => {
+        const trimmedRepo = repo.trim();
+        // If repo doesn't include owner, prepend it
+        return trimmedRepo.includes('/') ? trimmedRepo : `${owner}/${trimmedRepo}`;
+      });
+      core.info(`Rule ${i + 1}: Targeting ${matchedRepos.length} explicit repositories`);
+    }
+    // Handle "all" selector
+    else if (rule.selector.all === true) {
+      core.info(`Rule ${i + 1}: Targeting all repositories for ${owner}`);
+
+      // Fetch all repos for org/user
+      let isOrg = false;
+      try {
+        await octokit.rest.orgs.get({ org: owner });
+        isOrg = true;
+      } catch (error) {
+        // Only treat 404 as "not an org"; rethrow other errors to avoid masking real problems
+        if (error && typeof error === 'object' && 'status' in error && error.status === 404) {
+          isOrg = false;
+        } else {
+          throw error;
+        }
+      }
+
+      const perPage = 100;
+      let page = 1;
+      let hasMore = true;
+      while (hasMore) {
+        const { data } = isOrg
+          ? await octokit.rest.repos.listForOrg({ org: owner, type: 'all', per_page: perPage, page })
+          : await octokit.rest.repos.listForUser({ username: owner, type: 'all', per_page: perPage, page });
+
+        if (data.length === 0 || data.length < perPage) {
+          matchedRepos.push(...data.map(r => r.full_name));
+          hasMore = false;
+        } else {
+          matchedRepos.push(...data.map(r => r.full_name));
+          page++;
+        }
+      }
+      core.info(`  → Matched ${matchedRepos.length} repositories`);
+    } else {
+      throw new Error(`Rule ${i + 1}: selector must have "custom-property", "repos", or "all" property`);
+    }
+
+    // Merge settings for each matched repo
+    for (const repoName of matchedRepos) {
+      const existingSettings = repoSettingsMap.get(repoName) || { repo: repoName };
+      // Merge settings (later rules override earlier ones)
+      // Destructure to exclude 'repo' from rule.settings to prevent accidental overwrites
+      // eslint-disable-next-line no-unused-vars
+      const { repo: _ignoredRepo, ...safeSettings } = rule.settings;
+      repoSettingsMap.set(repoName, { ...existingSettings, ...safeSettings });
+    }
+  }
+
+  // Convert map to array and validate each merged config
+  const result = Array.from(repoSettingsMap.values());
+
+  // Validate merged settings for each repo (catches typos/unknown keys)
+  for (const repoConfig of result) {
+    validateRepoConfig(repoConfig, repoConfig.repo);
+  }
+
+  core.info(`Total: ${result.length} unique repositories to process`);
+
+  return result;
+}
+
+/**
  * Parse repository list from various input sources
  * @param {string} repositories - Comma-separated list or "all"
  * @param {string} repositoriesFile - Path to YAML file
- * @param {string} owner - Owner name (for "all" option)
+ * @param {string} owner - Owner name (for "all" option or custom property filtering)
  * @param {Octokit} octokit - Octokit instance
+ * @param {string} customPropertyName - Name of custom property to filter by (optional)
+ * @param {string} customPropertyValue - Comma-separated list of custom property values to match (optional)
  * @returns {Promise<Array>} Array of repository objects with settings
  */
-export async function parseRepositories(repositories, repositoriesFile, owner, octokit) {
+export async function parseRepositories(
+  repositories,
+  repositoriesFile,
+  owner,
+  octokit,
+  customPropertyName,
+  customPropertyValue
+) {
   let repoList = [];
 
+  // Validate custom property inputs
+  if (customPropertyName && !customPropertyValue) {
+    throw new Error('custom-property-value must be specified when custom-property-name is provided');
+  }
+  if (!customPropertyName && customPropertyValue) {
+    throw new Error('custom-property-name must be specified when custom-property-value is provided');
+  }
+
+  // Filter by custom property if specified
+  if (customPropertyName && customPropertyValue) {
+    const propertyValues = customPropertyValue
+      .split(',')
+      .map(v => v.trim())
+      .filter(v => v.length > 0);
+
+    if (propertyValues.length === 0) {
+      throw new Error('custom-property-value must contain at least one non-empty value after trimming');
+    }
+
+    repoList = await filterRepositoriesByCustomProperty(octokit, owner, customPropertyName, propertyValues);
+  }
   // Parse from YAML file if provided
-  if (repositoriesFile) {
+  else if (repositoriesFile) {
     try {
       const fileContent = fs.readFileSync(repositoriesFile, 'utf8');
       const data = yaml.load(fileContent);
 
-      // Only support repos array format
-      if (Array.isArray(data.repos)) {
+      // Check if this is a rules-based configuration
+      if (Array.isArray(data.rules)) {
+        core.info('Detected rules-based configuration file');
+        repoList = await parseConfigWithRules(data, octokit);
+      }
+      // Support repos array format (backwards compatible)
+      else if (Array.isArray(data.repos)) {
         repoList = data.repos.map(item => {
           if (typeof item === 'string') {
             // Simple string format: just repo name
@@ -176,7 +552,7 @@ export async function parseRepositories(repositories, repositoriesFile, owner, o
           }
         });
       } else {
-        throw new Error('YAML file must contain a "repos" array');
+        throw new Error('YAML file must contain a "rules" array or "repos" array');
       }
     } catch (error) {
       throw new Error(`Failed to parse repositories file: ${error.message}`);
@@ -243,7 +619,9 @@ export async function parseRepositories(repositories, repositoriesFile, owner, o
   }
 
   if (repoList.length === 0) {
-    throw new Error('No repositories specified. Use repositories, repositories-file, or repositories="all" with owner');
+    throw new Error(
+      'No repositories specified. Use repositories, repositories-file, repositories="all" with owner, or custom-property-name with custom-property-value'
+    );
   }
 
   return repoList;
@@ -845,8 +1223,17 @@ export async function updateRepositorySettings(
  *   - 'would-update-pr': Dry-run - would update existing PR branch
  */
 export async function syncFilesViaPullRequest(octokit, repo, options, dryRun) {
-  const { files, branchName, prTitle, prBodyCreate, prBodyUpdate, resultKey, fileDescription, contentProcessor } =
-    options;
+  const {
+    files,
+    branchName,
+    prTitle,
+    prBodyCreate,
+    prBodyUpdate,
+    resultKey,
+    fileDescription,
+    contentProcessor,
+    contentTransformer
+  } = options;
 
   const [owner, repoName] = repo.split('/');
 
@@ -874,6 +1261,12 @@ export async function syncFilesViaPullRequest(octokit, repo, options, dryRun) {
           dryRun
         };
       }
+
+      // Apply content transformer if provided (e.g., template variable replacement)
+      if (contentTransformer) {
+        sourceContent = contentTransformer(sourceContent);
+      }
+
       fileInfos.push({
         sourceFilePath: file.sourceFilePath,
         targetPath: file.targetPath,
@@ -2413,6 +2806,56 @@ export async function syncCopilotInstructions(octokit, repo, copilotInstructions
 }
 
 /**
+ * Sync CODEOWNERS file to target repository
+ * @param {Octokit} octokit - Octokit instance
+ * @param {string} repo - Repository in "owner/repo" format
+ * @param {string} codeownersPath - Path to local CODEOWNERS file
+ * @param {string} targetPath - Target path in the repository (.github/CODEOWNERS, CODEOWNERS, or docs/CODEOWNERS)
+ * @param {string} prTitle - Title for the pull request
+ * @param {boolean} dryRun - Preview mode without making actual changes
+ * @param {Object} [templateVars] - Optional template variables for {{variable}} replacement
+ * @returns {Promise<Object>} Result object
+ */
+export async function syncCodeowners(octokit, repo, codeownersPath, targetPath, prTitle, dryRun, templateVars = null) {
+  // Validate target path
+  const validPaths = ['.github/CODEOWNERS', 'CODEOWNERS', 'docs/CODEOWNERS'];
+  if (!validPaths.includes(targetPath)) {
+    return {
+      repository: repo,
+      success: false,
+      error: `Invalid CODEOWNERS target path: ${targetPath}. Must be one of: ${validPaths.join(', ')}`,
+      dryRun
+    };
+  }
+
+  // Create content transformer if template variables are provided
+  const contentTransformer =
+    templateVars &&
+    typeof templateVars === 'object' &&
+    !Array.isArray(templateVars) &&
+    Object.keys(templateVars).length > 0
+      ? content => replaceTemplateVariables(content, templateVars)
+      : null;
+
+  return syncFileViaPullRequest(
+    octokit,
+    repo,
+    {
+      sourceFilePath: codeownersPath,
+      targetPath,
+      branchName: 'codeowners-sync',
+      prTitle,
+      prBodyCreate: `This PR adds \`${targetPath}\` to define code ownership.\n\n**Changes:**\n- Added CODEOWNERS file`,
+      prBodyUpdate: `This PR updates \`${targetPath}\` to the latest version.\n\n**Changes:**\n- Updated CODEOWNERS file`,
+      resultKey: 'codeowners',
+      fileDescription: 'CODEOWNERS',
+      contentTransformer
+    },
+    dryRun
+  );
+}
+
+/**
  * Get a list of specific changes made to a repository
  * @param {Object} result - Repository update result object
  * @param {boolean} dryRun - Whether this is a dry-run
@@ -2421,6 +2864,14 @@ export async function syncCopilotInstructions(octokit, repo, copilotInstructions
 function getChangesList(result, dryRun) {
   const changes = [];
   const wouldPrefix = dryRun ? 'Would update ' : '';
+
+  /**
+   * Format a PR reference as a markdown link if URL is available
+   * @param {number} prNumber - PR number
+   * @param {string} prUrl - PR URL
+   * @returns {string} Formatted PR reference (linked or plain)
+   */
+  const formatPrRef = (prNumber, prUrl) => (prUrl ? `[PR #${prNumber}](${prUrl})` : `PR #${prNumber}`);
 
   // Repository settings changes
   if (result.changes && result.changes.length > 0) {
@@ -2487,12 +2938,20 @@ function getChangesList(result, dryRun) {
     result.dependabotSync.dependabotYml !== 'unchanged'
   ) {
     const status = result.dependabotSync.dependabotYml;
-    if (status === 'pr-exists') {
-      changes.push(`dependabot.yml PR exists (#${result.dependabotSync.prNumber})`);
+    if (status === 'pr-up-to-date') {
+      changes.push(
+        `dependabot.yml ${formatPrRef(result.dependabotSync.prNumber, result.dependabotSync.prUrl)} up-to-date (pending merge)`
+      );
+    } else if (status === 'pr-exists') {
+      changes.push(
+        `dependabot.yml PR exists (${formatPrRef(result.dependabotSync.prNumber, result.dependabotSync.prUrl)})`
+      );
     } else if (status.startsWith('would-')) {
       changes.push(`Would sync dependabot.yml`);
     } else {
-      changes.push(`${wouldPrefix}dependabot.yml (PR #${result.dependabotSync.prNumber})`);
+      changes.push(
+        `${wouldPrefix}dependabot.yml (${formatPrRef(result.dependabotSync.prNumber, result.dependabotSync.prUrl)})`
+      );
     }
   }
 
@@ -2503,19 +2962,28 @@ function getChangesList(result, dryRun) {
     result.gitignoreSync.gitignore !== 'unchanged'
   ) {
     const status = result.gitignoreSync.gitignore;
-    if (status === 'pr-exists') {
-      changes.push(`.gitignore PR exists (#${result.gitignoreSync.prNumber})`);
+    if (status === 'pr-up-to-date') {
+      changes.push(
+        `.gitignore ${formatPrRef(result.gitignoreSync.prNumber, result.gitignoreSync.prUrl)} up-to-date (pending merge)`
+      );
+    } else if (status === 'pr-exists') {
+      changes.push(`.gitignore PR exists (${formatPrRef(result.gitignoreSync.prNumber, result.gitignoreSync.prUrl)})`);
     } else if (status.startsWith('would-')) {
       changes.push(`Would sync .gitignore`);
     } else {
-      changes.push(`${wouldPrefix}.gitignore (PR #${result.gitignoreSync.prNumber})`);
+      changes.push(
+        `${wouldPrefix}.gitignore (${formatPrRef(result.gitignoreSync.prNumber, result.gitignoreSync.prUrl)})`
+      );
     }
   }
 
   // Ruleset changes
   if (result.rulesetSync?.success && result.rulesetSync.ruleset && result.rulesetSync.ruleset !== 'unchanged') {
     const status = result.rulesetSync.ruleset;
-    if (status.startsWith('would-')) {
+    if (status === 'pr-up-to-date') {
+      // Rulesets don't use PRs, so this shouldn't happen, but handle it gracefully
+      changes.push(`ruleset up-to-date`);
+    } else if (status.startsWith('would-')) {
       changes.push(`Would sync ruleset`);
     } else {
       changes.push(`${wouldPrefix}ruleset`);
@@ -2529,12 +2997,20 @@ function getChangesList(result, dryRun) {
     result.pullRequestTemplateSync.pullRequestTemplate !== 'unchanged'
   ) {
     const status = result.pullRequestTemplateSync.pullRequestTemplate;
-    if (status === 'pr-exists') {
-      changes.push(`PR template PR exists (#${result.pullRequestTemplateSync.prNumber})`);
+    if (status === 'pr-up-to-date') {
+      changes.push(
+        `PR template ${formatPrRef(result.pullRequestTemplateSync.prNumber, result.pullRequestTemplateSync.prUrl)} up-to-date (pending merge)`
+      );
+    } else if (status === 'pr-exists') {
+      changes.push(
+        `PR template PR exists (${formatPrRef(result.pullRequestTemplateSync.prNumber, result.pullRequestTemplateSync.prUrl)})`
+      );
     } else if (status.startsWith('would-')) {
       changes.push(`Would sync PR template`);
     } else {
-      changes.push(`${wouldPrefix}PR template (PR #${result.pullRequestTemplateSync.prNumber})`);
+      changes.push(
+        `${wouldPrefix}PR template (${formatPrRef(result.pullRequestTemplateSync.prNumber, result.pullRequestTemplateSync.prUrl)})`
+      );
     }
   }
 
@@ -2545,12 +3021,20 @@ function getChangesList(result, dryRun) {
     result.workflowFilesSync.workflowFiles !== 'unchanged'
   ) {
     const status = result.workflowFilesSync.workflowFiles;
-    if (status === 'pr-exists') {
-      changes.push(`workflow files PR exists (#${result.workflowFilesSync.prNumber})`);
+    if (status === 'pr-up-to-date') {
+      changes.push(
+        `workflow files ${formatPrRef(result.workflowFilesSync.prNumber, result.workflowFilesSync.prUrl)} up-to-date (pending merge)`
+      );
+    } else if (status === 'pr-exists') {
+      changes.push(
+        `workflow files PR exists (${formatPrRef(result.workflowFilesSync.prNumber, result.workflowFilesSync.prUrl)})`
+      );
     } else if (status.startsWith('would-')) {
       changes.push(`Would sync workflow files`);
     } else {
-      changes.push(`${wouldPrefix}workflow files (PR #${result.workflowFilesSync.prNumber})`);
+      changes.push(
+        `${wouldPrefix}workflow files (${formatPrRef(result.workflowFilesSync.prNumber, result.workflowFilesSync.prUrl)})`
+      );
     }
   }
 
@@ -2561,7 +3045,10 @@ function getChangesList(result, dryRun) {
     result.autolinksSync.autolinks !== 'unchanged'
   ) {
     const status = result.autolinksSync.autolinks;
-    if (status.startsWith('would-')) {
+    if (status === 'pr-up-to-date') {
+      // Autolinks don't use PRs, so this shouldn't happen, but handle it gracefully
+      changes.push(`autolinks up-to-date`);
+    } else if (status.startsWith('would-')) {
       changes.push(`Would sync autolinks`);
     } else {
       changes.push(`${wouldPrefix}autolinks`);
@@ -2575,12 +3062,20 @@ function getChangesList(result, dryRun) {
     result.copilotInstructionsSync.copilotInstructions !== 'unchanged'
   ) {
     const status = result.copilotInstructionsSync.copilotInstructions;
-    if (status === 'pr-exists') {
-      changes.push(`copilot-instructions.md PR exists (#${result.copilotInstructionsSync.prNumber})`);
+    if (status === 'pr-up-to-date') {
+      changes.push(
+        `copilot-instructions.md ${formatPrRef(result.copilotInstructionsSync.prNumber, result.copilotInstructionsSync.prUrl)} up-to-date (pending merge)`
+      );
+    } else if (status === 'pr-exists') {
+      changes.push(
+        `copilot-instructions.md PR exists (${formatPrRef(result.copilotInstructionsSync.prNumber, result.copilotInstructionsSync.prUrl)})`
+      );
     } else if (status.startsWith('would-')) {
       changes.push(`Would sync copilot-instructions.md`);
     } else {
-      changes.push(`${wouldPrefix}copilot-instructions.md (PR #${result.copilotInstructionsSync.prNumber})`);
+      changes.push(
+        `${wouldPrefix}copilot-instructions.md (${formatPrRef(result.copilotInstructionsSync.prNumber, result.copilotInstructionsSync.prUrl)})`
+      );
     }
   }
 
@@ -2591,12 +3086,44 @@ function getChangesList(result, dryRun) {
     result.packageJsonSync.packageJson !== 'unchanged'
   ) {
     const status = result.packageJsonSync.packageJson;
-    if (status === 'pr-exists') {
-      changes.push(`package.json PR exists (#${result.packageJsonSync.prNumber})`);
+    if (status === 'pr-up-to-date') {
+      changes.push(
+        `package.json ${formatPrRef(result.packageJsonSync.prNumber, result.packageJsonSync.prUrl)} up-to-date (pending merge)`
+      );
+    } else if (status === 'pr-exists') {
+      changes.push(
+        `package.json PR exists (${formatPrRef(result.packageJsonSync.prNumber, result.packageJsonSync.prUrl)})`
+      );
     } else if (status.startsWith('would-')) {
       changes.push(`Would sync package.json`);
     } else {
-      changes.push(`${wouldPrefix}package.json (PR #${result.packageJsonSync.prNumber})`);
+      changes.push(
+        `${wouldPrefix}package.json (${formatPrRef(result.packageJsonSync.prNumber, result.packageJsonSync.prUrl)})`
+      );
+    }
+  }
+
+  // CODEOWNERS changes
+  if (
+    result.codeownersSync?.success &&
+    result.codeownersSync.codeowners &&
+    result.codeownersSync.codeowners !== 'unchanged'
+  ) {
+    const status = result.codeownersSync.codeowners;
+    if (status === 'pr-up-to-date') {
+      changes.push(
+        `CODEOWNERS ${formatPrRef(result.codeownersSync.prNumber, result.codeownersSync.prUrl)} up-to-date (pending merge)`
+      );
+    } else if (status === 'pr-exists') {
+      changes.push(
+        `CODEOWNERS PR exists (${formatPrRef(result.codeownersSync.prNumber, result.codeownersSync.prUrl)})`
+      );
+    } else if (status.startsWith('would-')) {
+      changes.push(`Would sync CODEOWNERS`);
+    } else {
+      changes.push(
+        `${wouldPrefix}CODEOWNERS (${formatPrRef(result.codeownersSync.prNumber, result.codeownersSync.prUrl)})`
+      );
     }
   }
 
@@ -2606,9 +3133,13 @@ function getChangesList(result, dryRun) {
 /**
  * Check if a repository result has any changes
  * @param {Object} result - Repository update result object
- * @returns {boolean} True if there are any changes (settings, topics, code scanning, immutable releases, dependabot, gitignore, rulesets, pull request template, workflow files, autolinks, copilot instructions, or package.json)
+ * @returns {boolean} True if there are any changes (settings, topics, code scanning, immutable releases, dependabot, gitignore, rulesets, pull request template, workflow files, autolinks, copilot instructions, package.json, or codeowners)
  */
 function hasRepositoryChanges(result) {
+  // Helper to check if a sync status represents something to report
+  // 'unchanged' means nothing to show, but 'pr-up-to-date' means there's a pending PR to display
+  const hasSyncChanges = status => status && status !== 'unchanged';
+
   return (
     (result.changes && result.changes.length > 0) ||
     result.topicsChange ||
@@ -2618,38 +3149,21 @@ function hasRepositoryChanges(result) {
     result.secretScanningPushProtectionChange ||
     result.dependabotAlertsChange ||
     result.dependabotSecurityUpdatesChange ||
-    (result.dependabotSync &&
-      result.dependabotSync.success &&
-      result.dependabotSync.dependabotYml &&
-      result.dependabotSync.dependabotYml !== 'unchanged') ||
-    (result.gitignoreSync &&
-      result.gitignoreSync.success &&
-      result.gitignoreSync.gitignore &&
-      result.gitignoreSync.gitignore !== 'unchanged') ||
-    (result.rulesetSync &&
-      result.rulesetSync.success &&
-      result.rulesetSync.ruleset &&
-      result.rulesetSync.ruleset !== 'unchanged') ||
+    (result.dependabotSync && result.dependabotSync.success && hasSyncChanges(result.dependabotSync.dependabotYml)) ||
+    (result.gitignoreSync && result.gitignoreSync.success && hasSyncChanges(result.gitignoreSync.gitignore)) ||
+    (result.rulesetSync && result.rulesetSync.success && hasSyncChanges(result.rulesetSync.ruleset)) ||
     (result.pullRequestTemplateSync &&
       result.pullRequestTemplateSync.success &&
-      result.pullRequestTemplateSync.pullRequestTemplate &&
-      result.pullRequestTemplateSync.pullRequestTemplate !== 'unchanged') ||
+      hasSyncChanges(result.pullRequestTemplateSync.pullRequestTemplate)) ||
     (result.workflowFilesSync &&
       result.workflowFilesSync.success &&
-      result.workflowFilesSync.workflowFiles &&
-      result.workflowFilesSync.workflowFiles !== 'unchanged') ||
-    (result.autolinksSync &&
-      result.autolinksSync.success &&
-      result.autolinksSync.autolinks &&
-      result.autolinksSync.autolinks !== 'unchanged') ||
+      hasSyncChanges(result.workflowFilesSync.workflowFiles)) ||
+    (result.autolinksSync && result.autolinksSync.success && hasSyncChanges(result.autolinksSync.autolinks)) ||
     (result.copilotInstructionsSync &&
       result.copilotInstructionsSync.success &&
-      result.copilotInstructionsSync.copilotInstructions &&
-      result.copilotInstructionsSync.copilotInstructions !== 'unchanged') ||
-    (result.packageJsonSync &&
-      result.packageJsonSync.success &&
-      result.packageJsonSync.packageJson &&
-      result.packageJsonSync.packageJson !== 'unchanged')
+      hasSyncChanges(result.copilotInstructionsSync.copilotInstructions)) ||
+    (result.packageJsonSync && result.packageJsonSync.success && hasSyncChanges(result.packageJsonSync.packageJson)) ||
+    (result.codeownersSync && result.codeownersSync.success && hasSyncChanges(result.codeownersSync.codeowners))
   );
 }
 
@@ -2664,6 +3178,8 @@ export async function run() {
     const repositories = getInput('repositories');
     const repositoriesFile = getInput('repositories-file');
     const owner = getInput('owner');
+    const customPropertyName = getInput('custom-property-name');
+    const customPropertyValue = getInput('custom-property-value');
 
     // Get settings inputs
     const settings = {
@@ -2741,6 +3257,11 @@ export async function run() {
     const copilotInstructionsPrTitle =
       getInput('copilot-instructions-pr-title') || 'chore: update copilot-instructions.md';
 
+    // Get CODEOWNERS settings
+    const codeowners = getInput('codeowners');
+    const codeownersTargetPath = getInput('codeowners-target-path') || '.github/CODEOWNERS';
+    const codeownersPrTitle = getInput('codeowners-pr-title') || 'chore: update CODEOWNERS';
+
     // Get package.json sync settings
     const packageJsonFile = getInput('package-json-file');
     const syncScripts = getBooleanInput('package-json-sync-scripts');
@@ -2758,8 +3279,10 @@ export async function run() {
     }
 
     // Check if any settings are specified
+    // Skip this check if repositoriesFile is provided (rules-based configs define settings in file)
     const hasSecuritySettings = Object.values(securitySettings).some(value => value !== null);
     const hasSettings =
+      repositoriesFile ||
       Object.values(settings).some(value => value !== null) ||
       enableCodeScanning !== null ||
       immutableReleases !== null ||
@@ -2772,10 +3295,11 @@ export async function run() {
       (workflowFiles && workflowFiles.length > 0) ||
       autolinksFile ||
       copilotInstructionsMd ||
+      codeowners ||
       (packageJsonFile && (syncScripts || syncEngines));
     if (!hasSettings) {
       throw new Error(
-        'At least one repository setting must be specified (or code-scanning must be true, or immutable-releases must be specified, or security settings must be specified, or topics must be provided, or dependabot-yml must be specified, or gitignore must be specified, or rulesets-file must be specified, or pull-request-template must be specified, or workflow-files must be specified, or autolinks-file must be specified, or copilot-instructions-md must be specified, or package-json-file with package-json-sync-scripts or package-json-sync-engines must be specified)'
+        'At least one repository setting must be specified (or code-scanning must be true, or immutable-releases must be specified, or security settings must be specified, or topics must be provided, or dependabot-yml must be specified, or gitignore must be specified, or rulesets-file must be specified, or pull-request-template must be specified, or workflow-files must be specified, or autolinks-file must be specified, or copilot-instructions-md must be specified, or codeowners must be specified, or package-json-file with package-json-sync-scripts or package-json-sync-engines must be specified)'
       );
     }
 
@@ -2786,7 +3310,14 @@ export async function run() {
     });
 
     // Parse repository list
-    const repoList = await parseRepositories(repositories, repositoriesFile, owner, octokit);
+    const repoList = await parseRepositories(
+      repositories,
+      repositoriesFile,
+      owner,
+      octokit,
+      customPropertyName,
+      customPropertyValue
+    );
 
     core.info(`Processing ${repoList.length} repositories...`);
     core.info(`Settings to apply: ${JSON.stringify(settings, null, 2)}`);
@@ -2820,6 +3351,9 @@ export async function run() {
     if (copilotInstructionsMd) {
       core.info(`Copilot-instructions.md will be synced from: ${copilotInstructionsMd}`);
     }
+    if (codeowners) {
+      core.info(`CODEOWNERS will be synced from: ${codeowners} to ${codeownersTargetPath}`);
+    }
     if (securitySettings.secretScanning !== null) {
       core.info(`Secret scanning will be ${securitySettings.secretScanning ? 'enabled' : 'disabled'}`);
     }
@@ -2841,6 +3375,7 @@ export async function run() {
     const results = [];
     let successCount = 0;
     let failureCount = 0;
+    let changedCount = 0;
 
     for (const repoConfig of repoList) {
       const repo = repoConfig.repo;
@@ -2948,6 +3483,31 @@ export async function run() {
       let repoCopilotInstructionsMd = copilotInstructionsMd;
       if (repoConfig['copilot-instructions-md'] !== undefined) {
         repoCopilotInstructionsMd = repoConfig['copilot-instructions-md'];
+      }
+
+      // Handle repo-specific codeowners
+      let repoCodeowners = codeowners;
+      if (repoConfig['codeowners'] !== undefined) {
+        repoCodeowners = repoConfig['codeowners'];
+      }
+      let repoCodeownersTargetPath = codeownersTargetPath;
+      if (repoConfig['codeowners-target-path'] !== undefined) {
+        repoCodeownersTargetPath = repoConfig['codeowners-target-path'];
+      }
+      // Handle repo-specific codeowners-vars (template variables)
+      let repoCodeownersVars = null;
+      if (repoConfig['codeowners-vars'] !== undefined) {
+        if (
+          repoConfig['codeowners-vars'] !== null &&
+          typeof repoConfig['codeowners-vars'] === 'object' &&
+          !Array.isArray(repoConfig['codeowners-vars'])
+        ) {
+          repoCodeownersVars = repoConfig['codeowners-vars'];
+        } else {
+          core.warning(
+            `Invalid 'codeowners-vars' configuration for repo '${repoConfig.repo || repo}'; expected an object. This configuration will be ignored.`
+          );
+        }
       }
 
       // Handle repo-specific security settings
@@ -3118,6 +3678,36 @@ export async function run() {
         }
       }
 
+      // Sync CODEOWNERS if specified
+      if (repoCodeowners) {
+        core.info(`  👥 Checking CODEOWNERS...`);
+        if (repoCodeownersVars) {
+          const varNames = Object.keys(repoCodeownersVars).join(', ');
+          core.info(`  📝 Using template variables: ${varNames}`);
+        }
+        const codeownersResult = await syncCodeowners(
+          octokit,
+          repo,
+          repoCodeowners,
+          repoCodeownersTargetPath,
+          codeownersPrTitle,
+          dryRun,
+          repoCodeownersVars
+        );
+
+        // Add codeowners result to the main result
+        result.codeownersSync = codeownersResult;
+
+        if (codeownersResult.success) {
+          core.info(`  👥 ${codeownersResult.message}`);
+          if (codeownersResult.prUrl) {
+            core.info(`  🔗 PR URL: ${codeownersResult.prUrl}`);
+          }
+        } else {
+          core.warning(`  ⚠️  ${codeownersResult.error}`);
+        }
+      }
+
       // Sync package.json if specified
       const repoPackageJsonFile = repoConfig?.['package-json-file'] || packageJsonFile;
       const repoSyncScripts =
@@ -3158,6 +3748,9 @@ export async function run() {
       if (result.success) {
         successCount++;
         const repoHasChanges = hasRepositoryChanges(result);
+        if (repoHasChanges) {
+          changedCount++;
+        }
         if (dryRun) {
           if (repoHasChanges) {
             core.info(`🔍 Would update ${repo}`);
@@ -3331,7 +3924,10 @@ export async function run() {
     }
 
     // Set outputs
+    const unchangedCount = successCount - changedCount;
     core.setOutput('updated-repositories', successCount.toString());
+    core.setOutput('changed-repositories', changedCount.toString());
+    core.setOutput('unchanged-repositories', unchangedCount.toString());
     core.setOutput('failed-repositories', failureCount.toString());
     core.setOutput('results', JSON.stringify(results));
 
@@ -3364,7 +3960,7 @@ export async function run() {
           details = 'No changes needed';
         }
 
-        return [r.repository, '✅ Success', details];
+        return [r.repository, hasChanges ? '✅ Changed' : '➖ No changes', details];
       })
     ];
 
@@ -3381,7 +3977,8 @@ export async function run() {
 
       summaryBuilder
         .addRaw(`\n**Total Repositories:** ${repoList.length}`)
-        .addRaw(`\n**Successful:** ${successCount}`)
+        .addRaw(`\n**Changed:** ${changedCount}`)
+        .addRaw(`\n**Unchanged:** ${unchangedCount}`)
         .addRaw(`\n**Failed:** ${failureCount}\n\n`)
         .addTable(summaryTable)
         .write();
@@ -3392,7 +3989,8 @@ export async function run() {
         : '📊 Bulk Repository Settings Update Results';
       core.info(heading);
       core.info(`Total Repositories: ${repoList.length}`);
-      core.info(`Successful: ${successCount}`);
+      core.info(`Changed: ${changedCount}`);
+      core.info(`Unchanged: ${unchangedCount}`);
       core.info(`Failed: ${failureCount}`);
       for (const result of results) {
         if (!result.success) {
@@ -3406,7 +4004,7 @@ export async function run() {
             : hasChanges
               ? 'Updated'
               : 'No changes needed';
-          core.info(`  ${result.repository}: ✅ ${details}`);
+          core.info(`  ${result.repository}: ${hasChanges ? '✅' : '➖'} ${details}`);
         }
       }
     }

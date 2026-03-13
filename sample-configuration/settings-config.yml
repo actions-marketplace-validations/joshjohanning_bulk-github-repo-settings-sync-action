@@ -1,0 +1,85 @@
+# Advanced configuration file for bulk-github-repo-settings-sync-action
+# This format supports multiple rules with different selectors and settings
+
+# Organization to operate on (required for custom-property selectors)
+owner: my-org
+
+# Rules are processed in order. Each rule specifies:
+# - A selector (repos list, custom-property filter, or "all")
+# - Settings to apply to matching repositories
+#
+# If a repository matches multiple rules, settings are merged (later rules override earlier ones)
+rules:
+  # Rule 1: Platform repos get strict security settings
+  - selector:
+      custom-property:
+        name: team
+        values:
+          - platform
+    settings:
+      allow-squash-merge: true
+      allow-merge-commit: false
+      allow-rebase-merge: false
+      delete-branch-on-merge: true
+      code-scanning: true
+      secret-scanning: true
+      secret-scanning-push-protection: true
+      immutable-releases: true
+      dependabot-yml: './config/dependabot/npm-actions.yml'
+      rulesets-file: './config/rulesets/strict-ruleset.json'
+      workflow-files: './config/workflows/platform-ci.yml,./config/workflows/release.yml'
+      copilot-instructions-md: './config/copilot/platform-instructions.md'
+      codeowners: './config/CODEOWNERS.template'
+      codeowners-vars:
+        default_team: '@my-org/platform-team'
+        code_reviewers: '@my-org/platform-leads'
+
+  # Rule 2: Frontend and backend repos get monitoring but less strict settings
+  - selector:
+      custom-property:
+        name: team
+        values:
+          - frontend
+          - backend
+    settings:
+      allow-squash-merge: true
+      delete-branch-on-merge: true
+      code-scanning: true
+      secret-scanning: true
+      dependabot-yml: './config/dependabot/npm-actions.yml'
+
+  # Rule 3: Specific repositories with explicit overrides
+  - selector:
+      repos:
+        - my-org/critical-service
+        - my-org/payment-api
+    settings:
+      immutable-releases: true
+      dependabot-alerts: true
+      dependabot-security-updates: true
+      autolinks-file: './config/autolinks/jira.json'
+      codeowners: './config/CODEOWNERS.template'
+      codeowners-vars:
+        default_team: '@my-org/security-team'
+        code_reviewers: '@my-org/senior-engineers @my-org/security-leads'
+
+  # Rule 4: A single repo with unique settings
+  - selector:
+      repos:
+        - my-org/legacy-app
+    settings:
+      allow-merge-commit: true
+      allow-squash-merge: false
+      code-scanning: false
+
+# ---
+# Alternative simpler format - just repos with overrides (backwards compatible)
+# Use this if you don't need custom property filtering
+# See sample-configuration/repos.yml for this format
+#
+# repos:
+#   - repo: my-org/repo1
+#     allow-squash-merge: true
+#   - repo: my-org/repo2
+#     topics: 'javascript,automation'
+#   - my-org/repo3 # Simple string format, uses default settings

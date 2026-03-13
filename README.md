@@ -32,8 +32,10 @@ Update repository settings in bulk across multiple GitHub repositories.
 - 🔧 **Sync workflow files** across repositories via pull requests
 - 🔗 **Sync autolink references** across repositories
 - 🤖 **Sync copilot-instructions.md files** across repositories via pull requests
+- 👥 **Sync CODEOWNERS files** across repositories via pull requests
 - 📦 **Sync package.json properties** (scripts, engines) across repositories via pull requests
 - 📋 Support multiple repository input methods (comma-separated, YAML file, or all org repos)
+- 🎯 **Filter repositories by custom property values** for dynamic targeting
 - 🔍 **Dry-run mode** with change preview and intelligent change detection
 - 📋 **Per-repository overrides** via YAML configuration
 - 📊 **Comprehensive logging** showing before/after values for all changes
@@ -58,15 +60,39 @@ Update repository settings in bulk across multiple GitHub repositories.
     dependabot-alerts: true
     dependabot-security-updates: true
     dependabot-yml: './config/dependabot/npm-actions.yml'
+    gitignore: './config/.gitignore'
     rulesets-file: './config/rulesets/prod-ruleset.json'
     pull-request-template: './config/templates/pull_request_template.md'
+    workflow-files: './config/workflows/ci.yml,./config/workflows/release.yml'
     autolinks-file: './config/autolinks/jira-autolinks.json'
     copilot-instructions-md: './config/copilot/copilot-instructions.md'
+    codeowners: './config/CODEOWNERS'
+    package-json-file: './config/package.json'
     topics: 'javascript,github-actions,automation'
     dry-run: ${{ github.event_name == 'pull_request' }} # dry run if PR
 ```
 
-### Using YAML Configuration with Overrides
+---
+
+## Repository Selection Methods
+
+This action supports two approaches for selecting which repositories to manage. Choose based on your organization's needs:
+
+| Approach                                                                                      | Best For                                                                                         | Configuration File                        |
+| --------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ | ----------------------------------------- |
+| [**Option 1: Repository List**](#option-1-repository-list-reposyml)                           | Small to medium orgs, explicit control over which repos are managed                              | `repos.yml` with `repos:` array           |
+| [**Option 2: Rules-Based Selectors**](#option-2-rules-based-configuration-settings-configyml) | Large orgs, dynamic targeting by custom properties, different settings for different repo groups | `settings-config.yml` with `rules:` array |
+
+---
+
+### Option 1: Repository List (`repos.yml`)
+
+List repositories explicitly in a YAML file. Supports per-repository setting overrides.
+
+**Best for:** Explicit control over exactly which repositories are managed, with optional per-repo overrides.
+
+> [!TIP]
+> 📄 **See full example:** [sample-configuration/repos.yml](sample-configuration/repos.yml)
 
 Create a `repos.yml` file:
 
@@ -83,7 +109,7 @@ repos:
 Use in workflow:
 
 ```yml
-- name: Update Repository Settings with Overrides
+- name: Update Repository Settings
   uses: joshjohanning/bulk-github-repo-settings-sync-action@v1
   with:
     github-token: ${{ steps.app-token.outputs.token }}
@@ -94,6 +120,114 @@ Use in workflow:
     code-scanning: true
     topics: 'javascript,github-actions'
 ```
+
+**Also supports:**
+
+- Comma-separated list: `repositories: 'owner/repo1,owner/repo2'`
+- All org repos: `repositories: 'all'` with `owner: 'my-org'`
+- Custom property filtering: `custom-property-name` and `custom-property-value` (comma-separated for multiple values) with `owner` (organizations only)
+
+---
+
+### Option 2: Rules-Based Configuration (`settings-config.yml`)
+
+Define rules that target repositories using **selectors**. Each rule can use different selectors and apply different settings. This is the most powerful and scalable approach.
+
+**Best for:** Large organizations, dynamic targeting by custom properties, applying different settings to different repository groups in a single workflow.
+
+**Selector types:**
+
+| Selector          | Description                                   | Example                                                         |
+| ----------------- | --------------------------------------------- | --------------------------------------------------------------- |
+| `custom-property` | Filter by organization custom property values | `custom-property: { name: team, values: [platform, frontend] }` |
+| `repos`           | Explicit list of repositories                 | `repos: [my-org/repo1, my-org/repo2]`                           |
+
+> [!NOTE]
+> 💡 **Extensibility:** The selector pattern is designed to support future possible selectors like `topics`, `name-prefix`, `visibility`, etc.
+
+> [!TIP]
+> 📄 **See full example:** [sample-configuration/settings-config.yml](sample-configuration/settings-config.yml)
+
+Create a `settings-config.yml` file:
+
+```yaml
+owner: my-org
+
+rules:
+  # Rule 1: Platform repos get strict security settings
+  - selector:
+      custom-property:
+        name: team
+        values: [platform]
+    settings:
+      code-scanning: true
+      secret-scanning: true
+      secret-scanning-push-protection: true
+      immutable-releases: true
+      dependabot-yml: './config/dependabot/npm-actions.yml'
+
+  # Rule 2: Frontend and backend repos get monitoring but not immutable releases
+  - selector:
+      custom-property:
+        name: team
+        values: [frontend, backend]
+    settings:
+      code-scanning: true
+      secret-scanning: true
+
+  # Rule 3: Specific repos get additional overrides
+  - selector:
+      repos:
+        - my-org/special-repo
+        - my-org/another-repo
+    settings:
+      topics: 'special,monitored'
+      dependabot-alerts: true
+```
+
+Use in workflow:
+
+```yml
+- name: Apply Rules-Based Settings
+  uses: joshjohanning/bulk-github-repo-settings-sync-action@v1
+  with:
+    github-token: ${{ steps.app-token.outputs.token }}
+    repositories-file: 'settings-config.yml'
+```
+
+**Settings Merging:**
+
+When a repository matches multiple rules, settings are merged in order. Later rules override earlier rules for the same setting:
+
+```yaml
+# If repo1 matches both rules:
+rules:
+  - selector:
+      custom-property: { name: tier, values: [standard] }
+    settings:
+      code-scanning: true
+      topics: 'standard'
+
+  - selector:
+      repos: [my-org/repo1]
+    settings:
+      topics: 'special,override' # This overrides 'standard'
+      dependabot-alerts: true # This is added
+
+
+# Result for repo1:
+# code-scanning: true
+# topics: 'special,override'
+# dependabot-alerts: true
+```
+
+> **Note:** Custom properties are only available for GitHub organizations (not personal accounts) and must be configured at the organization level.
+
+---
+
+## Syncing Files and Configurations
+
+The following sections describe how to sync various files and configurations across repositories. These work with both repository selection methods above.
 
 ### Syncing Dependabot Configuration
 
@@ -400,6 +534,106 @@ repos:
 
 For more information on Copilot instructions, see the [GitHub Copilot documentation](https://docs.github.com/en/copilot/customizing-copilot/adding-custom-instructions-for-github-copilot).
 
+### Syncing CODEOWNERS
+
+Sync a `CODEOWNERS` file to target repositories via pull requests. CODEOWNERS files define who is responsible for reviewing changes to specific parts of a repository.
+
+```yml
+- name: Sync CODEOWNERS
+  uses: joshjohanning/bulk-github-repo-settings-sync-action@v1
+  with:
+    github-token: ${{ steps.app-token.outputs.token }}
+    repositories-file: 'repos.yml'
+    codeowners: './config/CODEOWNERS'
+    codeowners-target-path: '.github/CODEOWNERS' # default location
+    codeowners-pr-title: 'chore: update CODEOWNERS'
+```
+
+Or with repo-specific overrides in `repos.yml`:
+
+```yaml
+repos:
+  - repo: owner/repo1
+    codeowners: './config/codeowners/frontend-codeowners'
+  - repo: owner/repo2
+    codeowners: './config/codeowners/backend-codeowners'
+    codeowners-target-path: 'CODEOWNERS' # use root location instead
+  - repo: owner/repo3
+    codeowners: './.github/CODEOWNERS' # use the same config that this repo is using
+```
+
+**Using Template Variables:**
+
+For dynamic CODEOWNERS content (e.g., different teams per repository), use template variables with `{{variable_name}}` syntax. This is useful when:
+
+- Different teams own different repositories but you want a consistent CODEOWNERS structure
+- You want to manage a single template file instead of maintaining separate CODEOWNERS files per team
+- You're using rules-based configuration and want teams assigned automatically based on custom properties
+
+Create a template file (`./config/CODEOWNERS.template`):
+
+```text
+# Default reviewers
+* {{default_team}}
+
+# Additional reviewers
+* {{code_reviewers}}
+
+# Specific paths
+/docs/ {{docs_team}}
+```
+
+Then in `repos.yml`, specify the variables per repository:
+
+```yaml
+repos:
+  - repo: owner/frontend-app
+    codeowners: './config/CODEOWNERS.template'
+    codeowners-vars:
+      default_team: '@owner/frontend-team'
+      code_reviewers: '@owner/senior-devs'
+      docs_team: '@owner/docs-team'
+  - repo: owner/backend-api
+    codeowners: './config/CODEOWNERS.template'
+    codeowners-vars:
+      default_team: '@owner/backend-team'
+      code_reviewers: '@owner/platform-leads'
+      docs_team: '@owner/docs-team'
+```
+
+Or with rules-based configuration in `settings-config.yml` (recommended for larger organizations - new repos automatically get the right CODEOWNERS based on their custom property):
+
+```yaml
+rules:
+  - selector:
+      custom-property:
+        name: team
+        values: [platform]
+    settings:
+      codeowners: './config/CODEOWNERS.template'
+      codeowners-vars:
+        default_team: '@owner/platform-team'
+        code_reviewers: '@owner/platform-leads'
+```
+
+**Supported target paths:**
+
+| Path                 | Description                    |
+| -------------------- | ------------------------------ |
+| `.github/CODEOWNERS` | Default location (recommended) |
+| `CODEOWNERS`         | Repository root                |
+| `docs/CODEOWNERS`    | Inside the docs directory      |
+
+**Behavior:**
+
+- If the CODEOWNERS file doesn't exist, it creates it and opens a PR
+- If it exists but differs, it updates it via PR
+- If content is identical, no PR is created
+- PRs are created using the GitHub API so commits are verified
+- If an open PR already exists, updates the PR branch if the source content has changed
+
+For more information on CODEOWNERS, see the [GitHub documentation](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners).
+
 ### Syncing .gitignore Configuration
 
 Sync a `.gitignore` file to `.gitignore` in target repositories via pull requests:
@@ -559,7 +793,9 @@ Output shows what would change:
 | `github-api-url`                  | GitHub API URL (e.g., `https://api.github.com` for GitHub.com or `https://ghes.domain.com/api/v3` for GHES). Instance URL is auto-derived. | No       | `${{ github.api_url }}`                 |
 | `repositories`                    | Comma-separated list of repositories (`owner/repo`) or `"all"` for all org/user repos                                                      | No\*     | -                                       |
 | `repositories-file`               | Path to YAML file containing repository list                                                                                               | No\*     | -                                       |
-| `owner`                           | Owner (user or organization) name - required when using `repositories: "all"`                                                              | No       | -                                       |
+| `owner`                           | Owner (user or organization) name - required when using `repositories: "all"` or custom property filtering                                 | No       | -                                       |
+| `custom-property-name`            | Name of the custom property to filter repositories by (organizations only)                                                                 | No       | -                                       |
+| `custom-property-value`           | Comma-separated list of custom property values to match (used with `custom-property-name`)                                                 | No       | -                                       |
 | `allow-squash-merge`              | Allow squash merging pull requests                                                                                                         | No       | -                                       |
 | `allow-merge-commit`              | Allow merge commits for pull requests                                                                                                      | No       | -                                       |
 | `allow-rebase-merge`              | Allow rebase merging pull requests                                                                                                         | No       | -                                       |
@@ -586,21 +822,26 @@ Output shows what would change:
 | `autolinks-file`                  | Path to a JSON file containing autolink references to sync to target repositories                                                          | No       | -                                       |
 | `copilot-instructions-md`         | Path to a copilot-instructions.md file to sync to `.github/copilot-instructions.md` in target repositories                                 | No       | -                                       |
 | `copilot-instructions-pr-title`   | Title for pull requests when updating copilot-instructions.md                                                                              | No       | `chore: update copilot-instructions.md` |
+| `codeowners`                      | Path to a CODEOWNERS file to sync to target repositories                                                                                   | No       | -                                       |
+| `codeowners-target-path`          | Target path for the CODEOWNERS file (`.github/CODEOWNERS`, `CODEOWNERS`, or `docs/CODEOWNERS`)                                             | No       | `.github/CODEOWNERS`                    |
+| `codeowners-pr-title`             | Title for pull requests when updating CODEOWNERS                                                                                           | No       | `chore: update CODEOWNERS`              |
 | `package-json-file`               | Path to a package.json file to use as source for syncing scripts and/or engines                                                            | No       | -                                       |
 | `package-json-sync-scripts`       | Sync npm scripts from package-json-file to target repositories                                                                             | No       | `true`                                  |
 | `package-json-sync-engines`       | Sync engines field from package-json-file to target repositories (useful for Node.js version requirements)                                 | No       | `true`                                  |
 | `package-json-pr-title`           | Title for pull requests when updating package.json                                                                                         | No       | `chore: update package.json`            |
 | `dry-run`                         | Preview changes without applying them (logs what would be changed)                                                                         | No       | `false`                                 |
 
-\* Either `repositories` or `repositories-file` must be provided
+\* Repository selection: Use `repositories` (comma-separated list or `"all"`), `repositories-file`, or custom property filtering (`owner` + `custom-property-name` + `custom-property-value`)
 
 ## Action Outputs
 
-| Output                 | Description                                      |
-| ---------------------- | ------------------------------------------------ |
-| `updated-repositories` | Number of repositories successfully updated      |
-| `failed-repositories`  | Number of repositories that failed to update     |
-| `results`              | JSON array of update results for each repository |
+| Output                   | Description                                                             |
+| ------------------------ | ----------------------------------------------------------------------- |
+| `updated-repositories`   | Number of repositories successfully processed (changed + unchanged)     |
+| `changed-repositories`   | Number of repositories that had changes (or would have in dry-run mode) |
+| `unchanged-repositories` | Number of repositories that required no changes                         |
+| `failed-repositories`    | Number of repositories that failed to update                            |
+| `results`                | JSON array of update results for each repository                        |
 
 ## Authentication
 
