@@ -4,30 +4,10 @@
  *
  * Local Development & Testing:
  *
- * 1. Set environment variables to simulate GitHub Actions inputs:
- *    export INPUT_GITHUB_TOKEN="ghp_your_token_here"
- *    export INPUT_GITHUB_API_URL="https://api.github.com"  # Optional, defaults to github.api_url
- *    export INPUT_REPOSITORIES="owner/repo1,owner/repo2"
- *    export INPUT_ALLOW_SQUASH_MERGE="true"
- *    export INPUT_ALLOW_MERGE_COMMIT="false"
- *    export INPUT_ALLOW_REBASE_MERGE="true"
- *    export INPUT_ALLOW_AUTO_MERGE="true"
- *    export INPUT_DELETE_BRANCH_ON_MERGE="true"
- *    export INPUT_ALLOW_UPDATE_BRANCH="true"
- *    export INPUT_DEPENDABOT_YML="./path/to/dependabot.yml"
- *    export INPUT_DEPENDABOT_PR_TITLE="chore: update dependabot.yml"
+ * Uses core.getInput() which reads INPUT_<NAME> env vars (hyphens preserved).
+ * Since shell variables can't contain hyphens, set these via env(1):
  *
- * 2. Run locally:
- *    node src/index.js
- *
- * Example with YAML file:
- *    export INPUT_REPOSITORIES_FILE="repos.yml"
- *    node src/index.js
- *
- * Example with all repos:
- *    export INPUT_REPOSITORIES="all"
- *    export INPUT_OWNER="your-org-or-user"
- *    node src/index.js
+ *    env 'INPUT_GITHUB-TOKEN=ghp_xxx' 'INPUT_REPOSITORIES=owner/repo1,owner/repo2' node src/index.js
  */
 
 import * as core from '@actions/core';
@@ -151,33 +131,162 @@ export function replaceTemplateVariables(content, vars) {
   return result;
 }
 
-/**
- * Get input value (works reliably in both GitHub Actions and local environments)
- * @param {string} name - Input name (with dashes)
- * @returns {string} Input value
- */
-function getInput(name) {
-  // Try core.getInput first (works in GitHub Actions)
-  let value = core.getInput(name);
-
-  // Fallback: try direct environment variable access (for local development)
-  if (!value) {
-    const envName = `INPUT_${name.replace(/-/g, '_').toUpperCase()}`;
-    value = process.env[envName] || '';
+function getValidSquashMergeCommitTitle(currentTitle, message) {
+  if (message === 'COMMIT_MESSAGES') {
+    return currentTitle === 'COMMIT_OR_PR_TITLE' ? currentTitle : 'PR_TITLE';
   }
 
-  return value;
+  return 'PR_TITLE';
+}
+
+function getValidMergeCommitTitle(currentTitle, message) {
+  if (message === 'PR_TITLE') {
+    return currentTitle === 'MERGE_MESSAGE' ? currentTitle : 'PR_TITLE';
+  }
+
+  return 'PR_TITLE';
 }
 
 /**
- * Convert string input to boolean (more permissive than core.getBooleanInput)
+ * File-path config keys that should be resolved against base-path.
+ * @type {string[]}
+ */
+const FILE_PATH_CONFIG_KEYS = [
+  'rulesets-file',
+  'dependabot-yml',
+  'gitignore',
+  'workflow-files',
+  'copilot-instructions-md',
+  'codeowners',
+  'package-json-file',
+  'pull-request-template',
+  'autolinks-file',
+  'environments-file'
+];
+
+/**
+ * Resolve a single file path against a base path.
+ * Absolute paths are returned unchanged; relative paths are joined with basePath.
+ * Non-string or falsy values are returned as-is.
+ * @param {string} basePath - Base path to prepend
+ * @param {*} filePath - File path to resolve (non-string values returned unchanged)
+ * @returns {*} Resolved file path, or original value if not a non-empty string
+ */
+export function resolveFilePath(basePath, filePath) {
+  if (!filePath || typeof filePath !== 'string') return filePath;
+  if (path.isAbsolute(filePath)) return filePath;
+  return path.join(basePath, filePath);
+}
+
+/**
+ * Apply base-path resolution to all file-path config values in a repo config object.
+ * Handles string values, comma-separated strings (for rulesets-file/workflow-files),
+ * and array values.
+ * @param {Object} repoConfig - Repository configuration object
+ * @param {string} basePath - Base path to prepend to relative file paths
+ * @returns {Object} New repo config with resolved file paths
+ */
+export function applyBasePathToRepoConfig(repoConfig, basePath) {
+  if (!basePath) return repoConfig;
+
+  const resolved = { ...repoConfig };
+  for (const key of FILE_PATH_CONFIG_KEYS) {
+    if (resolved[key] === undefined) continue;
+
+    const value = resolved[key];
+    if (typeof value === 'string') {
+      // rulesets-file and workflow-files support comma-separated paths
+      if (key === 'rulesets-file' || key === 'workflow-files') {
+        resolved[key] = value
+          .split(',')
+          .map(p => p.trim())
+          .filter(p => p.length > 0)
+          .map(p => resolveFilePath(basePath, p))
+          .join(',');
+      } else {
+        resolved[key] = resolveFilePath(basePath, value);
+      }
+    } else if (Array.isArray(value)) {
+      resolved[key] = value.map(p => (typeof p === 'string' ? resolveFilePath(basePath, p) : p));
+    }
+  }
+
+  return resolved;
+}
+
+/**
+ * Get optional boolean input - returns null if not set.
+ * Unlike core.getBooleanInput (which throws on empty input), this returns null
+ * for unset inputs so callers can distinguish "not configured" from "false".
  * @param {string} name - Input name
  * @returns {boolean|null} Boolean value or null if not set
  */
 function getBooleanInput(name) {
-  const input = getInput(name).toLowerCase();
-  if (!input) return null;
-  return input === 'true' || input === '1' || input === 'yes';
+  const val = core.getInput(name);
+  if (val === '') return null;
+  return core.getBooleanInput(name);
+}
+
+/**
+ * Get optional enum input - returns null if not set.
+ * Validates the value against allowed values (case-insensitive).
+ * @param {string} name - Input name
+ * @param {string[]} allowedValues - Array of allowed enum values (uppercase)
+ * @returns {string|null} Uppercase enum value or null if not set
+ */
+function getEnumInput(name, allowedValues) {
+  const val = core.getInput(name);
+  if (val === '') return null;
+  const upper = val.trim().toUpperCase();
+  if (!allowedValues.includes(upper)) {
+    throw new Error(`Invalid value for '${name}': '${val}'. Allowed values: ${allowedValues.join(', ')}`);
+  }
+  return upper;
+}
+
+/**
+ * Coerce a repo-specific YAML config value to boolean.
+ * Falls back to the global default when the value is missing or not a proper boolean.
+ * @param {*} value - Raw value from YAML config
+ * @param {string} fieldName - Field name for warning messages
+ * @param {string} repo - Repository name for warning messages
+ * @param {boolean|null} globalDefault - Global input value to fall back to
+ * @returns {boolean|null} Coerced boolean or global default
+ */
+function coerceBooleanConfig(value, fieldName, repo, globalDefault) {
+  if (value === undefined) return globalDefault;
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    const lower = value.trim().toLowerCase();
+    if (lower === 'true') return true;
+    if (lower === 'false') return false;
+  }
+  core.warning(
+    `Invalid boolean value for '${fieldName}' in repo '${repo}': ${JSON.stringify(value)}. Using global default.`
+  );
+  return globalDefault;
+}
+
+/**
+ * Coerce a repo-specific YAML config value to an enum string.
+ * Falls back to the global default when the value is missing or not a valid enum.
+ * @param {*} value - Raw value from YAML config
+ * @param {string} fieldName - Field name for warning messages
+ * @param {string} repo - Repository name for warning messages
+ * @param {string[]} allowedValues - Array of allowed enum values (uppercase)
+ * @param {string|null} globalDefault - Global input value to fall back to
+ * @returns {string|null} Uppercase enum value or global default
+ */
+function coerceEnumConfig(value, fieldName, repo, allowedValues, globalDefault) {
+  if (value === undefined) return globalDefault;
+  if (typeof value === 'string') {
+    const upper = value.trim().toUpperCase();
+    if (allowedValues.includes(upper)) return upper;
+  }
+  core.warning(
+    `Invalid value for '${fieldName}' in repo '${repo}': ${JSON.stringify(value)}. Allowed values: ${allowedValues.join(', ')}. Using global default.`
+  );
+  return globalDefault;
 }
 
 /**
@@ -212,6 +321,73 @@ async function getOrgRepositoriesWithProperties(octokit, owner) {
   }
 
   return allRepos;
+}
+
+/**
+ * Get repository metadata, using a cache to avoid duplicate API calls.
+ * @param {Octokit} octokit - Octokit instance
+ * @param {string} repoFullName - Repository full name in owner/repo format
+ * @param {Map<string, Object>} repositoryMetadataCache - Cache keyed by repo full name
+ * @returns {Promise<Object>} GitHub repository metadata
+ */
+async function getRepositoryMetadata(octokit, repoFullName, repositoryMetadataCache) {
+  if (repositoryMetadataCache.has(repoFullName)) {
+    return repositoryMetadataCache.get(repoFullName);
+  }
+
+  const [repoOwner, repoName] = repoFullName.split('/');
+
+  try {
+    const { data } = await octokit.rest.repos.get({
+      owner: repoOwner,
+      repo: repoName
+    });
+
+    repositoryMetadataCache.set(repoFullName, data);
+    return data;
+  } catch (error) {
+    const wrappedError = new Error(`Failed to fetch metadata for repository ${repoFullName}: ${error.message}`);
+    if (error.status) {
+      wrappedError.status = error.status;
+    }
+    throw wrappedError;
+  }
+}
+
+const REPOSITORY_METADATA_FETCH_CONCURRENCY = 5;
+
+/**
+ * Map items with a bounded level of concurrency while preserving result order.
+ * @template TInput, TOutput
+ * @param {Array<TInput>} items - Items to map
+ * @param {number} concurrency - Maximum number of concurrent mapper executions
+ * @param {(item: TInput, index: number) => Promise<TOutput>} mapper - Async mapper function
+ * @returns {Promise<Array<TOutput>>} Mapped results in the original order
+ */
+async function mapWithConcurrencyLimit(items, concurrency, mapper) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (nextIndex < items.length) {
+      const currentIndex = nextIndex;
+      nextIndex++;
+      results[currentIndex] = await mapper(items[currentIndex], currentIndex);
+    }
+  }
+
+  const workerCount = Math.min(concurrency, items.length);
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+
+  return results;
+}
+
+async function ensureRepositoriesHaveMetadata(matchedRepos, octokit, repositoryMetadataCache) {
+  return mapWithConcurrencyLimit(matchedRepos, REPOSITORY_METADATA_FETCH_CONCURRENCY, async matchedRepo => ({
+    ...matchedRepo,
+    repository:
+      matchedRepo.repository ?? (await getRepositoryMetadata(octokit, matchedRepo.repo, repositoryMetadataCache))
+  }));
 }
 
 /**
@@ -300,6 +476,7 @@ export async function parseConfigWithRules(config, octokit) {
   // Cache for org repos with properties (to avoid refetching for each rule)
   // Cache for org verification and repo properties fetch
   let cachedReposWithProperties = null;
+  const repositoryMetadataCache = new Map();
   let orgVerified = false;
 
   // Map to track repositories and their merged settings
@@ -315,19 +492,32 @@ export async function parseConfigWithRules(config, octokit) {
       throw new Error(`Rule ${i + 1} must have a "selector" property`);
     }
 
-    if (!rule.settings) {
-      core.warning(`Rule ${i + 1} has no settings, skipping`);
-      continue;
+    // Default to empty settings object if not provided (rule applies default workflow settings)
+    if (rule.settings === undefined) {
+      rule.settings = {};
     }
 
     // Validate settings is a plain object
-    if (typeof rule.settings !== 'object' || Array.isArray(rule.settings)) {
+    if (rule.settings === null || typeof rule.settings !== 'object' || Array.isArray(rule.settings)) {
       throw new Error(
-        `Rule ${i + 1}: settings must be an object, got ${Array.isArray(rule.settings) ? 'array' : typeof rule.settings}`
+        `Rule ${i + 1}: settings must be an object, got ${rule.settings === null ? 'null' : Array.isArray(rule.settings) ? 'array' : typeof rule.settings}`
       );
     }
 
     let matchedRepos = [];
+
+    if (rule.selector.fork !== undefined && typeof rule.selector.fork !== 'boolean') {
+      throw new Error(`Rule ${i + 1}: selector "fork" must be a boolean, got ${typeof rule.selector.fork}`);
+    }
+
+    if (
+      rule.selector.visibility !== undefined &&
+      !['public', 'private', 'internal'].includes(rule.selector.visibility)
+    ) {
+      throw new Error(
+        `Rule ${i + 1}: selector "visibility" must be one of: public, private, internal (got ${rule.selector.visibility})`
+      );
+    }
 
     // Handle custom-property selector
     if (rule.selector['custom-property']) {
@@ -400,7 +590,7 @@ export async function parseConfigWithRules(config, octokit) {
             return false;
           });
         })
-        .map(repo => repo.repository_full_name);
+        .map(repo => ({ repo: repo.repository_full_name }));
 
       core.info(`  → Matched ${matchedRepos.length} repositories`);
     }
@@ -418,7 +608,7 @@ export async function parseConfigWithRules(config, octokit) {
       matchedRepos = rule.selector.repos.map(repo => {
         const trimmedRepo = repo.trim();
         // If repo doesn't include owner, prepend it
-        return trimmedRepo.includes('/') ? trimmedRepo : `${owner}/${trimmedRepo}`;
+        return { repo: trimmedRepo.includes('/') ? trimmedRepo : `${owner}/${trimmedRepo}` };
       });
       core.info(`Rule ${i + 1}: Targeting ${matchedRepos.length} explicit repositories`);
     }
@@ -447,12 +637,16 @@ export async function parseConfigWithRules(config, octokit) {
         const { data } = isOrg
           ? await octokit.rest.repos.listForOrg({ org: owner, type: 'all', per_page: perPage, page })
           : await octokit.rest.repos.listForUser({ username: owner, type: 'all', per_page: perPage, page });
+        const ownedRepositories = isOrg ? data : filterRepositoriesByOwner(data, owner);
+
+        matchedRepos.push(...ownedRepositories.map(repository => ({ repo: repository.full_name, repository })));
+        for (const repository of ownedRepositories) {
+          repositoryMetadataCache.set(repository.full_name, repository);
+        }
 
         if (data.length === 0 || data.length < perPage) {
-          matchedRepos.push(...data.map(r => r.full_name));
           hasMore = false;
         } else {
-          matchedRepos.push(...data.map(r => r.full_name));
           page++;
         }
       }
@@ -461,14 +655,30 @@ export async function parseConfigWithRules(config, octokit) {
       throw new Error(`Rule ${i + 1}: selector must have "custom-property", "repos", or "all" property`);
     }
 
+    if (rule.selector.fork !== undefined || rule.selector.visibility !== undefined) {
+      matchedRepos = await ensureRepositoriesHaveMetadata(matchedRepos, octokit, repositoryMetadataCache);
+    }
+
+    if (rule.selector.fork !== undefined) {
+      matchedRepos = matchedRepos.filter(matchedRepo => matchedRepo.repository.fork === rule.selector.fork);
+      core.info(`  → After fork filter (${rule.selector.fork}), ${matchedRepos.length} repositories remain`);
+    }
+
+    if (rule.selector.visibility !== undefined) {
+      matchedRepos = matchedRepos.filter(matchedRepo => matchedRepo.repository.visibility === rule.selector.visibility);
+      core.info(
+        `  → After visibility filter (${rule.selector.visibility}), ${matchedRepos.length} repositories remain`
+      );
+    }
+
     // Merge settings for each matched repo
-    for (const repoName of matchedRepos) {
-      const existingSettings = repoSettingsMap.get(repoName) || { repo: repoName };
+    for (const matchedRepo of matchedRepos) {
+      const existingSettings = repoSettingsMap.get(matchedRepo.repo) || { repo: matchedRepo.repo };
       // Merge settings (later rules override earlier ones)
       // Destructure to exclude 'repo' from rule.settings to prevent accidental overwrites
       // eslint-disable-next-line no-unused-vars
       const { repo: _ignoredRepo, ...safeSettings } = rule.settings;
-      repoSettingsMap.set(repoName, { ...existingSettings, ...safeSettings });
+      repoSettingsMap.set(matchedRepo.repo, { ...existingSettings, ...safeSettings });
     }
   }
 
@@ -554,6 +764,17 @@ export async function parseRepositories(
       } else {
         throw new Error('YAML file must contain a "rules" array or "repos" array');
       }
+
+      // Apply base-path resolution to file path config values
+      const rawBasePath = data['base-path'];
+      const basePath = typeof rawBasePath === 'string' ? rawBasePath.trim() : rawBasePath;
+      if (basePath) {
+        if (typeof basePath !== 'string') {
+          throw new Error(`'base-path' must be a string, got ${typeof basePath}`);
+        }
+        core.info(`Resolving file paths relative to base-path: ${basePath}`);
+        repoList = repoList.map(repo => applyBasePathToRepoConfig(repo, basePath));
+      }
     } catch (error) {
       throw new Error(`Failed to parse repositories file: ${error.message}`);
     }
@@ -594,11 +815,12 @@ export async function parseRepositories(
               per_page: 100,
               page
             });
+        const ownedRepositories = isOrg ? data : filterRepositoriesByOwner(data, owner);
 
         if (data.length === 0) {
           hasMore = false;
         } else {
-          repos.push(...data.map(r => ({ repo: r.full_name })));
+          repos.push(...ownedRepositories.map(r => ({ repo: r.full_name })));
           page++;
         }
       }
@@ -628,6 +850,407 @@ export async function parseRepositories(
 }
 
 /**
+ * Valid statuses for a sub-result.
+ * Only reportable statuses are included — unchanged/skipped operations
+ * do not push sub-results.
+ * @readonly
+ * @enum {string}
+ */
+const SubResultStatus = Object.freeze({
+  CHANGED: 'changed',
+  PENDING: 'pending',
+  WARNING: 'warning'
+});
+
+/**
+ * Human-readable labels for sync operation kinds in the summary table.
+ */
+const SYNC_KIND_LABELS = Object.freeze({
+  'dependabot-sync': 'dependabot.yml',
+  'gitignore-sync': '.gitignore',
+  'ruleset-sync': 'ruleset',
+  'ruleset-create': 'rulesets',
+  'ruleset-update': 'rulesets',
+  'ruleset-delete': 'rulesets',
+  'pr-template-sync': 'PR template',
+  'workflow-files-sync': 'workflow files',
+  'autolinks-sync': 'autolinks',
+  'environments-sync': 'environments',
+  'copilot-instructions-sync': 'copilot-instructions.md',
+  'codeowners-sync': 'CODEOWNERS',
+  'package-json-sync': 'package.json'
+});
+
+/**
+ * Create a normalized sub-result for a single feature operation.
+ * @param {string} kind - Feature identifier (e.g., 'settings', 'topics', 'code-scanning')
+ * @param {string} status - One of SubResultStatus values
+ * @param {string} message - Human-readable detail for logging
+ * @param {{ syncStatus?: string, prNumber?: number, prUrl?: string }} [extra] - Optional sync metadata
+ * @returns {{ kind: string, status: string, message: string, syncStatus?: string, prNumber?: number, prUrl?: string }}
+ */
+function createSubResult(kind, status, message, extra) {
+  const sub = { kind, status, message };
+  if (extra?.syncStatus) sub.syncStatus = extra.syncStatus;
+  if (extra?.prNumber) sub.prNumber = extra.prNumber;
+  if (extra?.prUrl) sub.prUrl = extra.prUrl;
+  return sub;
+}
+
+/**
+ * Derive a sub-result status from a sync helper's reported syncStatus.
+ * `pr-up-to-date` means an open sync PR already has the latest content — nothing
+ * was actioned this run, so it's reported as PENDING (just needs merging) rather
+ * than CHANGED. All other non-'unchanged' sync statuses represent real actions
+ * (commits pushed, PRs created/updated, stale PRs closed) and remain CHANGED.
+ * @param {string|undefined} syncStatus - Sync helper status (e.g. 'pr-up-to-date', 'created')
+ * @returns {string} SubResultStatus.PENDING or SubResultStatus.CHANGED
+ */
+function statusForSync(syncStatus) {
+  return syncStatus === 'pr-up-to-date' ? SubResultStatus.PENDING : SubResultStatus.CHANGED;
+}
+
+/**
+ * Filter repositories to those owned by the configured owner.
+ * GitHub's user repository listing can include repositories visible to the user
+ * that are owned by other accounts.
+ * @param {Array<Object>} repositories - Repository API responses
+ * @param {string} owner - Expected owner login
+ * @returns {Array<Object>} Repositories owned by the configured owner
+ */
+function filterRepositoriesByOwner(repositories, owner) {
+  if (typeof owner !== 'string') {
+    throw new TypeError(`Invalid repository owner configuration: expected a string but received ${typeof owner}`);
+  }
+  const normalizedOwner = owner.trim().toLowerCase();
+  return repositories.filter(repository => repository.owner?.login?.toLowerCase() === normalizedOwner);
+}
+
+/**
+ * Convert a hyphenated feature identifier to the camelCase stem used by legacy result keys.
+ * @param {string} featureId - Hyphenated feature identifier
+ * @returns {string} camelCase result key stem
+ */
+function getFeatureResultStem(featureId) {
+  const [firstPart, ...rest] = featureId.split('-');
+  return firstPart + rest.map(part => part.charAt(0).toUpperCase() + part.slice(1)).join('');
+}
+
+/**
+ * Capitalize the first character of a label for human-readable messages.
+ * @param {string} label - Label to capitalize
+ * @returns {string} Label with an uppercase first character
+ */
+function capitalizeLabel(label) {
+  return label.charAt(0).toUpperCase() + label.slice(1);
+}
+
+/**
+ * Repository settings that are diffed and synced via `repos.update`.
+ * `requiredCompanionField` is used for GitHub API fields that require a paired title value.
+ */
+const REPOSITORY_SETTING_FIELDS = Object.freeze([
+  { key: 'allow_squash_merge' },
+  { key: 'squash_merge_commit_title' },
+  {
+    key: 'squash_merge_commit_message',
+    requiredCompanionField: 'squash_merge_commit_title',
+    deriveCompanion: getValidSquashMergeCommitTitle
+  },
+  { key: 'allow_merge_commit' },
+  { key: 'merge_commit_title' },
+  {
+    key: 'merge_commit_message',
+    requiredCompanionField: 'merge_commit_title',
+    deriveCompanion: getValidMergeCommitTitle
+  },
+  { key: 'allow_rebase_merge' },
+  { key: 'allow_auto_merge' },
+  { key: 'delete_branch_on_merge' },
+  { key: 'allow_update_branch' }
+]);
+
+/**
+ * Handle a common boolean feature toggle flow.
+ * Reads current state, compares it to the desired value, applies changes when needed,
+ * and updates the shared result structure consistently.
+ * @param {Object} options - Toggle handler options
+ * @param {Object} options.result - Mutable repository result object
+ * @param {boolean|null} options.desiredValue - Desired feature state; null skips handling
+ * @param {boolean} options.dryRun - Preview mode without applying changes
+ * @param {string} options.featureId - Hyphenated feature identifier used for sub-results
+ * @param {string} options.label - Human-readable label used in messages
+ * @param {string} [options.resultStem] - Optional camelCase override for legacy result keys
+ * @param {Function} options.getCurrentValue - Async function returning the current boolean state
+ * @param {Function} options.enable - Async function to enable the feature
+ * @param {Function} options.disable - Async function to disable the feature
+ * @param {Function} [options.onWarning] - Optional callback invoked after warning state is set
+ * @returns {Promise<void>}
+ */
+async function handleBooleanFeatureToggle({
+  result,
+  desiredValue,
+  dryRun,
+  featureId,
+  label,
+  resultStem,
+  getCurrentValue,
+  enable,
+  disable,
+  onWarning
+}) {
+  if (desiredValue === null) {
+    return;
+  }
+
+  const featureStem = resultStem || getFeatureResultStem(featureId);
+  const featureKey = capitalizeLabel(featureStem);
+  const currentResultKey = `current${featureKey}`;
+  const changeResultKey = `${featureStem}Change`;
+  const updatedResultKey = `${featureStem}Updated`;
+  const wouldUpdateResultKey = `${featureStem}WouldUpdate`;
+  const unchangedResultKey = `${featureStem}Unchanged`;
+  const warningResultKey = `${featureStem}Warning`;
+
+  try {
+    const currentValue = await getCurrentValue();
+    result[currentResultKey] = currentValue;
+
+    if (currentValue !== desiredValue) {
+      result[changeResultKey] = {
+        from: currentValue,
+        to: desiredValue
+      };
+
+      if (!dryRun) {
+        if (desiredValue) {
+          await enable();
+        } else {
+          await disable();
+        }
+        result[updatedResultKey] = true;
+      } else {
+        result[wouldUpdateResultKey] = true;
+      }
+
+      const action = desiredValue ? 'enable' : 'disable';
+      const actionText = dryRun ? `Would ${action}` : `${action.charAt(0).toUpperCase()}${action.slice(1)}d`;
+      result.subResults.push(createSubResult(featureId, SubResultStatus.CHANGED, `${actionText} ${label}`));
+    } else {
+      result[unchangedResultKey] = true;
+    }
+  } catch (error) {
+    result[warningResultKey] = `Could not process ${label}: ${error.message}`;
+    result.hasWarnings = true;
+    result.subResults.push(
+      createSubResult(featureId, SubResultStatus.WARNING, `${capitalizeLabel(label)} produced a warning`)
+    );
+
+    if (onWarning) {
+      onWarning(error);
+    }
+  }
+}
+
+/**
+ * Handle a boolean feature backed by GitHub's GET + PUT/DELETE endpoint pattern.
+ * @param {Object} options - Endpoint toggle options
+ * @param {Object} options.ctx - Shared per-repository context
+ * @param {Object} options.ctx.octokit - Octokit client
+ * @param {string} options.ctx.owner - Repository owner
+ * @param {string} options.ctx.repoName - Repository name
+ * @param {Object} options.ctx.result - Mutable repository result object
+ * @param {boolean} options.ctx.dryRun - Preview mode without applying changes
+ * @param {boolean|null} options.desiredValue - Desired feature state; null skips handling
+ * @param {string} options.featureId - Hyphenated feature identifier used for sub-results
+ * @param {string} options.label - Human-readable label used in messages
+ * @param {string} options.getRoute - REST route for reading the current state
+ * @param {string} options.setRoute - REST path used for both enabling and disabling
+ * @param {Function} options.readCurrentValue - Maps the GET response into a boolean
+ * @param {boolean} [options.notFoundMeans] - Treat 404 from GET as this boolean current value
+ * @param {Object} [options.headers] - Optional request headers
+ * @param {Function} [options.onWarning] - Optional callback invoked after warning state is set
+ * @returns {Promise<void>}
+ */
+async function handleBooleanEndpointToggle({
+  ctx,
+  desiredValue,
+  featureId,
+  label,
+  getRoute,
+  setRoute,
+  readCurrentValue,
+  notFoundMeans,
+  headers,
+  onWarning
+}) {
+  const { octokit, owner, repoName, result, dryRun } = ctx;
+  return handleBooleanFeatureToggle({
+    result,
+    desiredValue,
+    dryRun,
+    featureId,
+    label,
+    getCurrentValue: async () => {
+      try {
+        const response = await octokit.request(getRoute, {
+          owner,
+          repo: repoName,
+          headers
+        });
+        return readCurrentValue(response);
+      } catch (error) {
+        if (error.status === 404 && typeof notFoundMeans === 'boolean') {
+          return notFoundMeans;
+        }
+        throw error;
+      }
+    },
+    enable: async () =>
+      octokit.request(`PUT ${setRoute}`, {
+        owner,
+        repo: repoName,
+        headers
+      }),
+    disable: async () =>
+      octokit.request(`DELETE ${setRoute}`, {
+        owner,
+        repo: repoName,
+        headers
+      }),
+    onWarning
+  });
+}
+
+/**
+ * Handle a boolean feature managed via `security_and_analysis` repo updates.
+ * @param {Object} options - Security setting toggle options
+ * @param {Object} options.ctx - Shared per-repository context
+ * @param {Object} options.ctx.octokit - Octokit client
+ * @param {string} options.ctx.owner - Repository owner
+ * @param {string} options.ctx.repoName - Repository name
+ * @param {Object} options.ctx.currentRepo - Current repository payload
+ * @param {Object} options.ctx.result - Mutable repository result object
+ * @param {boolean} options.ctx.dryRun - Preview mode without applying changes
+ * @param {boolean|null} options.desiredValue - Desired feature state; null skips handling
+ * @param {string} options.featureId - Hyphenated feature identifier used for sub-results
+ * @param {string} options.label - Human-readable label used in messages
+ * @param {string} options.securityAnalysisKey - Key under `security_and_analysis`
+ * @param {string} [options.resultStem] - Optional camelCase override for legacy result keys
+ * @param {Function} [options.onWarning] - Optional callback invoked after warning state is set
+ * @returns {Promise<void>}
+ */
+async function handleSecurityAnalysisToggle({
+  ctx,
+  desiredValue,
+  featureId,
+  label,
+  securityAnalysisKey,
+  resultStem,
+  onWarning
+}) {
+  const { octokit, owner, repoName, currentRepo, result, dryRun } = ctx;
+  return handleBooleanFeatureToggle({
+    result,
+    desiredValue,
+    dryRun,
+    featureId,
+    label,
+    resultStem,
+    getCurrentValue: async () => currentRepo.security_and_analysis?.[securityAnalysisKey]?.status === 'enabled',
+    enable: async () =>
+      octokit.rest.repos.update({
+        owner,
+        repo: repoName,
+        security_and_analysis: {
+          [securityAnalysisKey]: {
+            status: 'enabled'
+          }
+        }
+      }),
+    disable: async () =>
+      octokit.rest.repos.update({
+        owner,
+        repo: repoName,
+        security_and_analysis: {
+          [securityAnalysisKey]: {
+            status: 'disabled'
+          }
+        }
+      }),
+    onWarning
+  });
+}
+
+/**
+ * Format a curated summary message for a sub-result in the summary table.
+ * Uses the label map for human-readable names and sync status for phrasing.
+ * @param {{ kind: string, status: string, message: string, syncStatus?: string, prNumber?: number }} subResult
+ * @param {boolean} dryRun - Whether this is a dry-run
+ * @returns {string} Curated summary text
+ */
+function formatSubResultSummary(subResult, dryRun) {
+  const label = SYNC_KIND_LABELS[subResult.kind];
+  if (!label) return subResult.message;
+
+  const syncStatus = subResult.syncStatus;
+  if (!syncStatus) {
+    // Only prefix with label for per-operation ruleset subResults
+    if (subResult.kind.startsWith('ruleset-')) {
+      return `${label}: ${subResult.message}`;
+    }
+    return subResult.message;
+  }
+
+  const hasPr = subResult.prNumber != null;
+  const prRef = hasPr ? formatPrLink(subResult.prNumber, subResult.prUrl) : '';
+
+  if (syncStatus === 'pr-up-to-date') {
+    return `${label} ${prRef} up-to-date (pending merge)`;
+  } else if (syncStatus === 'stale-pr-closed') {
+    return `Closed stale ${prRef} for ${label}`;
+  } else if (syncStatus === 'would-close-stale-pr') {
+    return `Would close stale ${prRef} for ${label}`;
+  } else if (syncStatus === 'would-update-pr') {
+    return `Would update existing ${prRef} for ${label}`;
+  } else if (syncStatus.startsWith('would-')) {
+    return `Would sync ${label}`;
+  }
+
+  const wouldPrefix = dryRun ? 'Would sync ' : '';
+  return hasPr ? `${wouldPrefix}${label} (${prRef})` : `${wouldPrefix}${label}`;
+}
+
+export function escapeHtmlAttribute(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+export function formatPrLink(prNumber, prUrl) {
+  if (!prUrl) {
+    return `PR #${prNumber}`;
+  }
+
+  try {
+    const parsedUrl = new URL(prUrl);
+    if (parsedUrl.protocol !== 'https:') {
+      core.warning(`Ignoring PR URL with unsupported protocol in summary: ${prUrl}`);
+      return `PR #${prNumber}`;
+    }
+
+    const safeUrl = escapeHtmlAttribute(prUrl);
+    return `<a href="${safeUrl}">PR #${prNumber}</a>`;
+  } catch {
+    core.warning(`Ignoring invalid PR URL in summary: ${prUrl}`);
+    return `PR #${prNumber}`;
+  }
+}
+
+/**
  * Update repository settings
  * @param {Octokit} octokit - Octokit instance
  * @param {string} repo - Repository in "owner/repo" format
@@ -638,6 +1261,7 @@ export async function parseRepositories(
  * @param {Object} securitySettings - Security settings to update
  * @param {boolean|null} securitySettings.secretScanning - Enable or disable secret scanning
  * @param {boolean|null} securitySettings.secretScanningPushProtection - Enable or disable push protection
+ * @param {boolean|null} securitySettings.privateVulnerabilityReporting - Enable or disable private vulnerability reporting
  * @param {boolean|null} securitySettings.dependabotAlerts - Enable or disable Dependabot alerts
  * @param {boolean|null} securitySettings.dependabotSecurityUpdates - Enable or disable Dependabot security updates
  * @param {boolean} dryRun - Preview mode without making actual changes
@@ -659,7 +1283,10 @@ export async function updateRepositorySettings(
     return {
       repository: repo,
       success: false,
-      error: 'Invalid repository format. Expected "owner/repo"'
+      hasWarnings: false,
+      subResults: [],
+      error: 'Invalid repository format. Expected "owner/repo"',
+      dryRun
     };
   }
 
@@ -681,6 +1308,8 @@ export async function updateRepositorySettings(
         return {
           repository: repo,
           success: false,
+          hasWarnings: false,
+          subResults: [],
           error: 'Access denied - GitHub App or token does not have permission to access this repository',
           accessDenied: true,
           dryRun
@@ -688,6 +1317,18 @@ export async function updateRepositorySettings(
       }
       // Re-throw other errors
       throw error;
+    }
+
+    if (currentRepo.archived) {
+      return {
+        repository: repo,
+        success: true,
+        hasWarnings: false,
+        subResults: [],
+        archived: true,
+        changes: [],
+        dryRun
+      };
     }
 
     // Check if we have insufficient permissions
@@ -699,6 +1340,8 @@ export async function updateRepositorySettings(
       return {
         repository: repo,
         success: false,
+        hasWarnings: false,
+        subResults: [],
         error: 'Insufficient permissions - GitHub App may not be installed or does not have any access',
         insufficientPermissions: true,
         dryRun
@@ -724,6 +1367,8 @@ export async function updateRepositorySettings(
       return {
         repository: repo,
         success: false,
+        hasWarnings: false,
+        subResults: [],
         error:
           'Cannot read repository settings - GitHub App may not be installed on this repository or does not have sufficient access',
         insufficientPermissions: true,
@@ -739,86 +1384,79 @@ export async function updateRepositorySettings(
     const changes = [];
     const currentSettings = {};
 
-    // Only add settings that are explicitly set (not null) and track changes
-    if (settings.allow_squash_merge !== null) {
-      updateParams.allow_squash_merge = settings.allow_squash_merge;
-      currentSettings.allow_squash_merge = currentRepo.allow_squash_merge;
-      if (currentRepo.allow_squash_merge !== settings.allow_squash_merge) {
-        changes.push({
-          setting: 'allow_squash_merge',
-          from: currentRepo.allow_squash_merge,
-          to: settings.allow_squash_merge
-        });
+    for (const field of REPOSITORY_SETTING_FIELDS) {
+      const desiredValue = settings[field.key];
+      if (desiredValue == null) {
+        continue;
       }
-    }
-    if (settings.allow_merge_commit !== null) {
-      updateParams.allow_merge_commit = settings.allow_merge_commit;
-      currentSettings.allow_merge_commit = currentRepo.allow_merge_commit;
-      if (currentRepo.allow_merge_commit !== settings.allow_merge_commit) {
-        changes.push({
-          setting: 'allow_merge_commit',
-          from: currentRepo.allow_merge_commit,
-          to: settings.allow_merge_commit
-        });
+
+      updateParams[field.key] = desiredValue;
+      currentSettings[field.key] = currentRepo[field.key];
+
+      if (field.requiredCompanionField && !updateParams[field.requiredCompanionField]) {
+        const companionKey = field.requiredCompanionField;
+        const currentCompanionValue = currentRepo[companionKey];
+        const derivedCompanionValue = field.deriveCompanion
+          ? field.deriveCompanion(currentCompanionValue, desiredValue)
+          : currentCompanionValue;
+        updateParams[companionKey] = derivedCompanionValue;
+
+        if (!(companionKey in currentSettings)) {
+          currentSettings[companionKey] = currentCompanionValue;
+          if (currentCompanionValue !== derivedCompanionValue) {
+            changes.push({
+              setting: companionKey,
+              from: currentCompanionValue,
+              to: derivedCompanionValue
+            });
+          }
+        }
       }
-    }
-    if (settings.allow_rebase_merge !== null) {
-      updateParams.allow_rebase_merge = settings.allow_rebase_merge;
-      currentSettings.allow_rebase_merge = currentRepo.allow_rebase_merge;
-      if (currentRepo.allow_rebase_merge !== settings.allow_rebase_merge) {
+
+      if (currentRepo[field.key] !== desiredValue) {
         changes.push({
-          setting: 'allow_rebase_merge',
-          from: currentRepo.allow_rebase_merge,
-          to: settings.allow_rebase_merge
-        });
-      }
-    }
-    if (settings.allow_auto_merge !== null) {
-      updateParams.allow_auto_merge = settings.allow_auto_merge;
-      currentSettings.allow_auto_merge = currentRepo.allow_auto_merge;
-      if (currentRepo.allow_auto_merge !== settings.allow_auto_merge) {
-        changes.push({
-          setting: 'allow_auto_merge',
-          from: currentRepo.allow_auto_merge,
-          to: settings.allow_auto_merge
-        });
-      }
-    }
-    if (settings.delete_branch_on_merge !== null) {
-      updateParams.delete_branch_on_merge = settings.delete_branch_on_merge;
-      currentSettings.delete_branch_on_merge = currentRepo.delete_branch_on_merge;
-      if (currentRepo.delete_branch_on_merge !== settings.delete_branch_on_merge) {
-        changes.push({
-          setting: 'delete_branch_on_merge',
-          from: currentRepo.delete_branch_on_merge,
-          to: settings.delete_branch_on_merge
-        });
-      }
-    }
-    if (settings.allow_update_branch !== null) {
-      updateParams.allow_update_branch = settings.allow_update_branch;
-      currentSettings.allow_update_branch = currentRepo.allow_update_branch;
-      if (currentRepo.allow_update_branch !== settings.allow_update_branch) {
-        changes.push({
-          setting: 'allow_update_branch',
-          from: currentRepo.allow_update_branch,
-          to: settings.allow_update_branch
+          setting: field.key,
+          from: currentRepo[field.key],
+          to: desiredValue
         });
       }
     }
 
+    // TODO(v3): Remove legacy properties from the result object (e.g., topicsChange, codeScanningWarning,
+    // secretScanningUpdated, hasWarnings, etc.) once consumers have migrated to subResults.
+    // Legacy properties are preserved for backward compatibility of the results JSON output.
+    // See: https://github.com/joshjohanning/bulk-github-repo-settings-sync-action/pull/120
     const result = {
       repository: repo,
       success: true,
+      hasWarnings: false,
+      subResults: [],
       settings: updateParams,
       currentSettings,
       changes,
       dryRun
     };
 
+    const ctx = {
+      octokit,
+      owner,
+      repoName,
+      currentRepo,
+      result,
+      dryRun
+    };
+
     // Update repository settings (skip in dry-run mode)
     if (!dryRun && changes.length > 0) {
       await octokit.rest.repos.update(updateParams);
+    }
+
+    if (changes.length > 0) {
+      const wouldPrefix = dryRun ? 'Would update ' : '';
+      const settingNames = changes.map(c => c.setting.replace(/_/g, '-'));
+      result.subResults.push(
+        createSubResult('settings', SubResultStatus.CHANGED, `${wouldPrefix}settings: ${settingNames.join(', ')}`)
+      );
     }
 
     // Handle topics
@@ -859,17 +1497,26 @@ export async function updateRepositorySettings(
           } else {
             result.topicsWouldUpdate = true;
           }
+          const topicChanges = [];
+          if (topicsToAdd.length > 0) topicChanges.push(`+${topicsToAdd.join(', ')}`);
+          if (topicsToRemove.length > 0) topicChanges.push(`-${topicsToRemove.join(', ')}`);
+          const wouldPrefix = dryRun ? 'Would update ' : '';
+          result.subResults.push(
+            createSubResult('topics', SubResultStatus.CHANGED, `${wouldPrefix}topics: ${topicChanges.join(', ')}`)
+          );
         } else {
           result.topicsUnchanged = true;
         }
         result.topics = topics;
       } catch (error) {
         result.topicsWarning = `Could not process topics: ${error.message}`;
+        result.hasWarnings = true;
+        result.subResults.push(createSubResult('topics', SubResultStatus.WARNING, 'Topics produced a warning'));
       }
     }
 
     // Handle CodeQL scanning
-    if (enableCodeScanning) {
+    if (enableCodeScanning !== null) {
       try {
         // Try to get current code scanning setup
         let currentCodeScanning = null;
@@ -879,303 +1526,160 @@ export async function updateRepositorySettings(
             repo: repoName
           });
           currentCodeScanning = codeScanningData.state;
-        } catch {
-          // Default setup might not exist yet
-          currentCodeScanning = 'not-configured';
+        } catch (error) {
+          if (error.status === 404 || (error.status === 403 && !enableCodeScanning)) {
+            currentCodeScanning = 'not-configured';
+          } else {
+            throw error;
+          }
         }
 
         result.currentCodeScanning = currentCodeScanning;
 
-        if (currentCodeScanning !== 'configured') {
+        const desiredState = enableCodeScanning ? 'configured' : 'not-configured';
+
+        if (currentCodeScanning !== desiredState) {
           result.codeScanningChange = {
             from: currentCodeScanning,
-            to: 'configured'
+            to: desiredState
           };
 
           if (!dryRun) {
             await octokit.rest.codeScanning.updateDefaultSetup({
               owner,
               repo: repoName,
-              state: 'configured',
+              state: desiredState,
               query_suite: 'default'
             });
-            result.codeScanningEnabled = true;
+            if (enableCodeScanning) {
+              result.codeScanningEnabled = true;
+            } else {
+              result.codeScanningDisabled = true;
+            }
           } else {
-            result.codeScanningWouldEnable = true;
+            if (enableCodeScanning) {
+              result.codeScanningWouldEnable = true;
+            } else {
+              result.codeScanningWouldDisable = true;
+            }
           }
+          const action = enableCodeScanning ? 'enable' : 'disable';
+          const actionText = dryRun ? `Would ${action}` : `${action.charAt(0).toUpperCase()}${action.slice(1)}d`;
+          result.subResults.push(
+            createSubResult('code-scanning', SubResultStatus.CHANGED, `${actionText} CodeQL scanning`)
+          );
         } else {
           result.codeScanningUnchanged = true;
         }
       } catch (error) {
         // CodeQL setup might fail for various reasons (not supported language, already enabled, etc.)
         result.codeScanningWarning = `Could not process CodeQL: ${error.message}`;
+        result.hasWarnings = true;
+        result.subResults.push(
+          createSubResult('code-scanning', SubResultStatus.WARNING, 'CodeQL scanning produced a warning')
+        );
       }
     }
 
     // Handle immutable releases
-    if (immutableReleases !== null) {
-      try {
-        // Check current immutable releases status
-        let currentImmutableReleases = false;
-        try {
-          const response = await octokit.request('GET /repos/{owner}/{repo}/immutable-releases', {
-            owner,
-            repo: repoName,
-            headers: {
-              'X-GitHub-Api-Version': '2022-11-28'
-            }
-          });
-          // Check the 'enabled' property in the response
-          currentImmutableReleases = response.data.enabled === true;
-        } catch (error) {
-          // 404 means immutable releases are not enabled
-          if (error.status === 404) {
-            currentImmutableReleases = false;
-          } else {
-            throw error;
-          }
-        }
-
-        result.currentImmutableReleases = currentImmutableReleases;
-
-        if (currentImmutableReleases !== immutableReleases) {
-          result.immutableReleasesChange = {
-            from: currentImmutableReleases,
-            to: immutableReleases
-          };
-
-          if (!dryRun) {
-            if (immutableReleases) {
-              // Enable immutable releases
-              await octokit.request('PUT /repos/{owner}/{repo}/immutable-releases', {
-                owner,
-                repo: repoName,
-                headers: {
-                  'X-GitHub-Api-Version': '2022-11-28'
-                }
-              });
-            } else {
-              // Disable immutable releases
-              await octokit.request('DELETE /repos/{owner}/{repo}/immutable-releases', {
-                owner,
-                repo: repoName,
-                headers: {
-                  'X-GitHub-Api-Version': '2022-11-28'
-                }
-              });
-            }
-            result.immutableReleasesUpdated = true;
-          } else {
-            result.immutableReleasesWouldUpdate = true;
-          }
-        } else {
-          result.immutableReleasesUnchanged = true;
-        }
-      } catch (error) {
-        // Immutable releases might fail for various reasons (insufficient permissions, not available, etc.)
-        result.immutableReleasesWarning = `Could not process immutable releases: ${error.message}`;
+    await handleBooleanEndpointToggle({
+      ctx,
+      desiredValue: immutableReleases,
+      featureId: 'immutable-releases',
+      label: 'immutable releases',
+      getRoute: 'GET /repos/{owner}/{repo}/immutable-releases',
+      setRoute: '/repos/{owner}/{repo}/immutable-releases',
+      readCurrentValue: response => response.data.enabled === true,
+      notFoundMeans: false,
+      headers: {
+        'X-GitHub-Api-Version': '2022-11-28'
       }
-    }
+    });
 
     // Handle security settings (only if securitySettings object is provided)
     if (securitySettings) {
       // Handle secret scanning settings
-      if (securitySettings.secretScanning !== null) {
-        try {
-          // Get current secret scanning status from security_and_analysis
-          const currentSecretScanning = currentRepo.security_and_analysis?.secret_scanning?.status === 'enabled';
-          result.currentSecretScanning = currentSecretScanning;
-
-          if (currentSecretScanning !== securitySettings.secretScanning) {
-            result.secretScanningChange = {
-              from: currentSecretScanning,
-              to: securitySettings.secretScanning
-            };
-
-            if (!dryRun) {
-              await octokit.rest.repos.update({
-                owner,
-                repo: repoName,
-                security_and_analysis: {
-                  secret_scanning: {
-                    status: securitySettings.secretScanning ? 'enabled' : 'disabled'
-                  }
-                }
-              });
-              result.secretScanningUpdated = true;
-            } else {
-              result.secretScanningWouldUpdate = true;
-            }
-          } else {
-            result.secretScanningUnchanged = true;
+      await handleSecurityAnalysisToggle({
+        ctx,
+        desiredValue: securitySettings.secretScanning,
+        featureId: 'secret-scanning',
+        label: 'secret scanning',
+        securityAnalysisKey: 'secret_scanning',
+        onWarning: error => {
+          if (
+            securitySettings.secretScanningPushProtection === true &&
+            typeof error.status === 'number' &&
+            (error.status === 403 || error.status === 404)
+          ) {
+            result.secretScanningPushProtectionWarning =
+              'Cannot enable push protection without secret scanning enabled';
+            result.subResults.push(
+              createSubResult(
+                'push-protection',
+                SubResultStatus.WARNING,
+                'Secret scanning push protection produced a warning'
+              )
+            );
           }
-        } catch (error) {
-          result.secretScanningWarning = `Could not process secret scanning: ${error.message}`;
         }
-      }
+      });
 
       // Handle secret scanning push protection settings
-      if (securitySettings.secretScanningPushProtection !== null) {
-        try {
-          // Get current push protection status from security_and_analysis
-          const currentPushProtection =
-            currentRepo.security_and_analysis?.secret_scanning_push_protection?.status === 'enabled';
-          result.currentSecretScanningPushProtection = currentPushProtection;
-
-          if (currentPushProtection !== securitySettings.secretScanningPushProtection) {
-            result.secretScanningPushProtectionChange = {
-              from: currentPushProtection,
-              to: securitySettings.secretScanningPushProtection
-            };
-
-            if (!dryRun) {
-              await octokit.rest.repos.update({
-                owner,
-                repo: repoName,
-                security_and_analysis: {
-                  secret_scanning_push_protection: {
-                    status: securitySettings.secretScanningPushProtection ? 'enabled' : 'disabled'
-                  }
-                }
-              });
-              result.secretScanningPushProtectionUpdated = true;
-            } else {
-              result.secretScanningPushProtectionWouldUpdate = true;
-            }
-          } else {
-            result.secretScanningPushProtectionUnchanged = true;
-          }
-        } catch (error) {
-          result.secretScanningPushProtectionWarning = `Could not process secret scanning push protection: ${error.message}`;
-        }
+      // Skip if we already set a cascade warning from secret scanning failure
+      if (securitySettings.secretScanningPushProtection !== null && !result.secretScanningPushProtectionWarning) {
+        await handleSecurityAnalysisToggle({
+          ctx,
+          desiredValue: securitySettings.secretScanningPushProtection,
+          featureId: 'push-protection',
+          label: 'secret scanning push protection',
+          securityAnalysisKey: 'secret_scanning_push_protection',
+          resultStem: 'secretScanningPushProtection'
+        });
       }
+
+      // Handle private vulnerability reporting
+      await handleBooleanEndpointToggle({
+        ctx,
+        desiredValue: securitySettings.privateVulnerabilityReporting,
+        featureId: 'private-vulnerability-reporting',
+        label: 'private vulnerability reporting',
+        getRoute: 'GET /repos/{owner}/{repo}/private-vulnerability-reporting',
+        setRoute: '/repos/{owner}/{repo}/private-vulnerability-reporting',
+        readCurrentValue: response => response.data.enabled === true,
+        headers: {
+          'X-GitHub-Api-Version': '2022-11-28'
+        }
+      });
 
       // Handle Dependabot alerts (vulnerability alerts)
-      if (securitySettings.dependabotAlerts !== null) {
-        try {
-          // Check current vulnerability alerts status
-          let currentDependabotAlerts = false;
-          try {
-            await octokit.request('GET /repos/{owner}/{repo}/vulnerability-alerts', {
-              owner,
-              repo: repoName,
-              headers: {
-                'X-GitHub-Api-Version': '2022-11-28'
-              }
-            });
-            // 204 means enabled
-            currentDependabotAlerts = true;
-          } catch (error) {
-            // 404 means disabled
-            if (error.status === 404) {
-              currentDependabotAlerts = false;
-            } else {
-              throw error;
-            }
-          }
-
-          result.currentDependabotAlerts = currentDependabotAlerts;
-
-          if (currentDependabotAlerts !== securitySettings.dependabotAlerts) {
-            result.dependabotAlertsChange = {
-              from: currentDependabotAlerts,
-              to: securitySettings.dependabotAlerts
-            };
-
-            if (!dryRun) {
-              if (securitySettings.dependabotAlerts) {
-                // Enable vulnerability alerts (also enables dependency graph)
-                await octokit.request('PUT /repos/{owner}/{repo}/vulnerability-alerts', {
-                  owner,
-                  repo: repoName,
-                  headers: {
-                    'X-GitHub-Api-Version': '2022-11-28'
-                  }
-                });
-              } else {
-                // Disable vulnerability alerts
-                await octokit.request('DELETE /repos/{owner}/{repo}/vulnerability-alerts', {
-                  owner,
-                  repo: repoName,
-                  headers: {
-                    'X-GitHub-Api-Version': '2022-11-28'
-                  }
-                });
-              }
-              result.dependabotAlertsUpdated = true;
-            } else {
-              result.dependabotAlertsWouldUpdate = true;
-            }
-          } else {
-            result.dependabotAlertsUnchanged = true;
-          }
-        } catch (error) {
-          result.dependabotAlertsWarning = `Could not process Dependabot alerts: ${error.message}`;
+      await handleBooleanEndpointToggle({
+        ctx,
+        desiredValue: securitySettings.dependabotAlerts,
+        featureId: 'dependabot-alerts',
+        label: 'Dependabot alerts',
+        getRoute: 'GET /repos/{owner}/{repo}/vulnerability-alerts',
+        setRoute: '/repos/{owner}/{repo}/vulnerability-alerts',
+        readCurrentValue: () => true,
+        notFoundMeans: false,
+        headers: {
+          'X-GitHub-Api-Version': '2022-11-28'
         }
-      }
+      });
 
       // Handle Dependabot security updates
-      if (securitySettings.dependabotSecurityUpdates !== null) {
-        try {
-          // Check current Dependabot security updates status
-          let currentDependabotSecurityUpdates = false;
-          try {
-            const response = await octokit.request('GET /repos/{owner}/{repo}/automated-security-fixes', {
-              owner,
-              repo: repoName,
-              headers: {
-                'X-GitHub-Api-Version': '2022-11-28'
-              }
-            });
-            currentDependabotSecurityUpdates = response.data.enabled === true;
-          } catch (error) {
-            // 404 means disabled
-            if (error.status === 404) {
-              currentDependabotSecurityUpdates = false;
-            } else {
-              throw error;
-            }
-          }
-
-          result.currentDependabotSecurityUpdates = currentDependabotSecurityUpdates;
-
-          if (currentDependabotSecurityUpdates !== securitySettings.dependabotSecurityUpdates) {
-            result.dependabotSecurityUpdatesChange = {
-              from: currentDependabotSecurityUpdates,
-              to: securitySettings.dependabotSecurityUpdates
-            };
-
-            if (!dryRun) {
-              if (securitySettings.dependabotSecurityUpdates) {
-                // Enable Dependabot security updates
-                await octokit.request('PUT /repos/{owner}/{repo}/automated-security-fixes', {
-                  owner,
-                  repo: repoName,
-                  headers: {
-                    'X-GitHub-Api-Version': '2022-11-28'
-                  }
-                });
-              } else {
-                // Disable Dependabot security updates
-                await octokit.request('DELETE /repos/{owner}/{repo}/automated-security-fixes', {
-                  owner,
-                  repo: repoName,
-                  headers: {
-                    'X-GitHub-Api-Version': '2022-11-28'
-                  }
-                });
-              }
-              result.dependabotSecurityUpdatesUpdated = true;
-            } else {
-              result.dependabotSecurityUpdatesWouldUpdate = true;
-            }
-          } else {
-            result.dependabotSecurityUpdatesUnchanged = true;
-          }
-        } catch (error) {
-          result.dependabotSecurityUpdatesWarning = `Could not process Dependabot security updates: ${error.message}`;
+      await handleBooleanEndpointToggle({
+        ctx,
+        desiredValue: securitySettings.dependabotSecurityUpdates,
+        featureId: 'dependabot-security-updates',
+        label: 'Dependabot security updates',
+        getRoute: 'GET /repos/{owner}/{repo}/automated-security-fixes',
+        setRoute: '/repos/{owner}/{repo}/automated-security-fixes',
+        readCurrentValue: response => response.data.enabled === true,
+        notFoundMeans: false,
+        headers: {
+          'X-GitHub-Api-Version': '2022-11-28'
         }
-      }
+      });
     } // End of if (securitySettings)
 
     return result;
@@ -1183,9 +1687,144 @@ export async function updateRepositorySettings(
     return {
       repository: repo,
       success: false,
+      hasWarnings: false,
+      subResults: [],
       error: error.message,
       dryRun
     };
+  }
+}
+
+/**
+ * Close stale PRs created by this action when the source file has been reverted to match the target.
+ * Searches for open PRs on the given sync branch and closes them with an explanatory comment.
+ * Only closes PRs created by the authenticated user/app to avoid closing unrelated PRs.
+ * @param {Octokit} octokit - Octokit instance
+ * @param {string} repo - Repository in "owner/repo" format
+ * @param {string} branchName - Branch name used by the sync type (e.g., 'dependabot-yml-sync')
+ * @param {boolean} dryRun - Preview mode without making actual changes
+ * @param {string} [authenticatedLogin] - Login of the authenticated user/app. If empty, stale PR check is skipped.
+ * @returns {Promise<{action: string, prNumber: number, prUrl: string, message: string}|null>}
+ *   Result object with action ('closed', 'would-close', or 'warned'), or null if no stale PR found.
+ */
+export async function closeStaleActionPrs(octokit, repo, branchName, dryRun, authenticatedLogin) {
+  const [owner, repoName] = repo.split('/');
+
+  // If authenticatedLogin is unknown, skip stale PR cleanup entirely
+  if (!authenticatedLogin) {
+    core.debug(`  Skipping stale PR check — authenticated user unknown`);
+    return null;
+  }
+
+  try {
+    const { data: pulls } = await octokit.rest.pulls.list({
+      owner,
+      repo: repoName,
+      state: 'open',
+      head: `${owner}:${branchName}`,
+      per_page: 100
+    });
+
+    if (pulls.length === 0) return null;
+
+    // Process all matching stale PRs
+    let lastResult = null;
+    let closedResult = null;
+    let remainingOpenPrs = pulls.length;
+
+    for (const pr of pulls) {
+      // Safety check: only close PRs created by the same user/app running the action
+      if (pr.user?.login !== authenticatedLogin) {
+        const message = `Found stale PR #${pr.number} on branch ${branchName} but it was created by ${pr.user?.login || 'unknown'}, not ${authenticatedLogin} — skipping auto-close.`;
+        core.warning(`  ⚠️  ${message}`);
+        lastResult = {
+          action: 'warned',
+          prNumber: pr.number,
+          prUrl: pr.html_url,
+          message
+        };
+        continue;
+      }
+
+      if (dryRun) {
+        const message = `Would close stale PR #${pr.number} (source matches target)`;
+        core.info(`  🔍 ${message}`);
+        const result = {
+          action: 'would-close',
+          prNumber: pr.number,
+          prUrl: pr.html_url,
+          message
+        };
+        closedResult = result;
+        lastResult = result;
+        continue;
+      }
+
+      // Close the PR (per-PR error handling to preserve previous results)
+      try {
+        // Close the PR first (priority), then add comment (best-effort)
+        await octokit.rest.pulls.update({
+          owner,
+          repo: repoName,
+          pull_number: pr.number,
+          state: 'closed'
+        });
+
+        // Best-effort comment explaining why
+        try {
+          await octokit.rest.issues.createComment({
+            owner,
+            repo: repoName,
+            issue_number: pr.number,
+            body: 'Closing: the source file has been reverted to match the current target. This PR is no longer needed.'
+          });
+        } catch (commentError) {
+          core.debug(`  Could not add comment to PR #${pr.number}: ${commentError.message}`);
+        }
+
+        remainingOpenPrs--;
+        const message = `Closed stale PR #${pr.number} (source matches target)`;
+        core.info(`  🗑️  ${message}`);
+        const result = {
+          action: 'closed',
+          prNumber: pr.number,
+          prUrl: pr.html_url,
+          message
+        };
+        closedResult = result;
+        lastResult = result;
+      } catch (error) {
+        const message = `Failed to close stale PR #${pr.number}: ${error.message}`;
+        core.warning(`  ⚠️  ${message}`);
+        lastResult = {
+          action: 'warned',
+          prNumber: pr.number,
+          prUrl: pr.html_url,
+          message
+        };
+      }
+    }
+
+    // Clean up the branch only if no open PRs remain on it
+    if (!dryRun && remainingOpenPrs === 0) {
+      try {
+        await octokit.rest.git.deleteRef({
+          owner,
+          repo: repoName,
+          ref: `heads/${branchName}`
+        });
+        core.info(`  🗑️  Deleted branch ${branchName}`);
+      } catch (error) {
+        core.debug(`  Could not delete branch ${branchName}: ${error.message}`);
+      }
+    }
+
+    // Prefer closed/would-close result over warned
+    return closedResult || lastResult;
+  } catch (error) {
+    // Non-fatal error - don't fail the sync because of stale PR cleanup
+    core.warning(`  ⚠️  Could not check for stale PRs: ${error.message}`);
+    return null;
   }
 }
 
@@ -1207,6 +1846,8 @@ export async function updateRepositorySettings(
  * @param {Object} [options.contentProcessor] - Optional processor for custom content handling (e.g., preserving repo-specific sections)
  * @param {Function} [options.contentProcessor.getComparableExisting] - (existingContent) => content to compare against source
  * @param {Function} [options.contentProcessor.getFinalContent] - (sourceContent, existingContent) => content to commit
+ * @param {Function} [options.contentTransformer] - Optional function to transform file content before syncing
+ * @param {string} [options.authenticatedLogin] - Login of the authenticated user/app for stale PR matching
  * @param {boolean} dryRun - Preview mode without making actual changes
  * @returns {Promise<Object>} Result object with `success` boolean and `[resultKey]` status string.
  *   Possible status values:
@@ -1221,6 +1862,8 @@ export async function updateRepositorySettings(
  *   - 'would-create': Dry-run - would create new file(s)
  *   - 'would-update': Dry-run - would update existing file(s)
  *   - 'would-update-pr': Dry-run - would update existing PR branch
+ *   - 'stale-pr-closed': Source matches target and a stale PR was auto-closed
+ *   - 'would-close-stale-pr': Dry-run - would close a stale PR
  */
 export async function syncFilesViaPullRequest(octokit, repo, options, dryRun) {
   const {
@@ -1232,7 +1875,8 @@ export async function syncFilesViaPullRequest(octokit, repo, options, dryRun) {
     resultKey,
     fileDescription,
     contentProcessor,
-    contentTransformer
+    contentTransformer,
+    authenticatedLogin
   } = options;
 
   const [owner, repoName] = repo.split('/');
@@ -1329,12 +1973,29 @@ export async function syncFilesViaPullRequest(octokit, repo, options, dryRun) {
       }
     }
 
-    // If no files need updates, return early
+    // If no files need updates, check for stale PRs and return
     if (filesToUpdate.length === 0) {
       const targetPaths = fileInfos.map(f => f.targetPath);
+
+      // Check for stale open PRs that should be closed (source reverted to match target)
+      const stalePrResult = await closeStaleActionPrs(octokit, repo, branchName, dryRun, authenticatedLogin);
+
+      if (stalePrResult && (stalePrResult.action === 'closed' || stalePrResult.action === 'would-close')) {
+        return {
+          repository: repo,
+          success: true,
+          [resultKey]: stalePrResult.action === 'closed' ? 'stale-pr-closed' : 'would-close-stale-pr',
+          message: stalePrResult.message,
+          prNumber: stalePrResult.prNumber,
+          prUrl: stalePrResult.prUrl,
+          filesProcessed: targetPaths,
+          dryRun
+        };
+      }
+
       const message =
         fileInfos.length === 1 ? `${targetPaths[0]} is already up to date` : 'All files are already up to date';
-      return {
+      const result = {
         repository: repo,
         success: true,
         [resultKey]: 'unchanged',
@@ -1342,6 +2003,13 @@ export async function syncFilesViaPullRequest(octokit, repo, options, dryRun) {
         filesProcessed: targetPaths,
         dryRun
       };
+
+      // If stale PR was warned (author mismatch), attach warning info
+      if (stalePrResult && stalePrResult.action === 'warned') {
+        result.stalePrWarning = stalePrResult;
+      }
+
+      return result;
     }
 
     // Check if there's already an open PR for this update
@@ -1711,9 +2379,10 @@ export async function syncFileViaPullRequest(octokit, repo, options, dryRun) {
  * @param {string} dependabotYmlPath - Path to local dependabot.yml file
  * @param {string} prTitle - Title for the pull request
  * @param {boolean} dryRun - Preview mode without making actual changes
+ * @param {string} [authenticatedLogin] - Login of the authenticated user/app for stale PR matching
  * @returns {Promise<Object>} Result object
  */
-export async function syncDependabotYml(octokit, repo, dependabotYmlPath, prTitle, dryRun) {
+export async function syncDependabotYml(octokit, repo, dependabotYmlPath, prTitle, dryRun, authenticatedLogin) {
   return syncFileViaPullRequest(
     octokit,
     repo,
@@ -1725,7 +2394,8 @@ export async function syncDependabotYml(octokit, repo, dependabotYmlPath, prTitl
       prBodyCreate: `This PR adds \`.github/dependabot.yml\` to enable Dependabot.\n\n**Changes:**\n- Added dependabot configuration`,
       prBodyUpdate: `This PR updates \`.github/dependabot.yml\` to the latest version.\n\n**Changes:**\n- Updated dependabot configuration`,
       resultKey: 'dependabotYml',
-      fileDescription: 'dependabot.yml'
+      fileDescription: 'dependabot.yml',
+      authenticatedLogin
     },
     dryRun
   );
@@ -1800,9 +2470,10 @@ const gitignoreContentProcessor = {
  * @param {string} gitignorePath - Path to local .gitignore file
  * @param {string} prTitle - Title for the pull request
  * @param {boolean} dryRun - Preview mode without making actual changes
+ * @param {string} [authenticatedLogin] - Login of the authenticated user/app for stale PR matching
  * @returns {Promise<Object>} Result object
  */
-export async function syncGitignore(octokit, repo, gitignorePath, prTitle, dryRun) {
+export async function syncGitignore(octokit, repo, gitignorePath, prTitle, dryRun, authenticatedLogin) {
   return syncFileViaPullRequest(
     octokit,
     repo,
@@ -1815,6 +2486,7 @@ export async function syncGitignore(octokit, repo, gitignorePath, prTitle, dryRu
       prBodyUpdate: `This PR updates \`.gitignore\` to the latest version.\n\n**Changes:**\n- Updated .gitignore configuration\n- Repository-specific entries have been preserved`,
       resultKey: 'gitignore',
       fileDescription: '.gitignore',
+      authenticatedLogin,
       contentProcessor: gitignoreContentProcessor
     },
     dryRun
@@ -1852,9 +2524,19 @@ function deepEqual(obj1, obj2) {
  * @param {boolean} syncEngines - Whether to sync the engines field
  * @param {string} prTitle - Title for the pull request
  * @param {boolean} dryRun - Preview mode without making actual changes
+ * @param {string} [authenticatedLogin] - Login of the authenticated user/app for stale PR matching
  * @returns {Promise<Object>} Result object
  */
-export async function syncPackageJson(octokit, repo, packageJsonPath, syncScripts, syncEngines, prTitle, dryRun) {
+export async function syncPackageJson(
+  octokit,
+  repo,
+  packageJsonPath,
+  syncScripts,
+  syncEngines,
+  prTitle,
+  dryRun,
+  authenticatedLogin
+) {
   const [owner, repoName] = repo.split('/');
   const targetPath = 'package.json';
   const branchName = 'package-json-sync';
@@ -1959,15 +2641,37 @@ export async function syncPackageJson(octokit, repo, packageJsonPath, syncScript
       }
     }
 
-    // If no changes needed, return early
+    // If no changes needed, check for stale PRs and return
     if (changes.length === 0) {
-      return {
+      // Check for stale open PRs that should be closed (source reverted to match target)
+      const stalePrResult = await closeStaleActionPrs(octokit, repo, branchName, dryRun, authenticatedLogin);
+
+      if (stalePrResult && (stalePrResult.action === 'closed' || stalePrResult.action === 'would-close')) {
+        return {
+          repository: repo,
+          success: true,
+          packageJson: stalePrResult.action === 'closed' ? 'stale-pr-closed' : 'would-close-stale-pr',
+          message: stalePrResult.message,
+          prNumber: stalePrResult.prNumber,
+          prUrl: stalePrResult.prUrl,
+          dryRun
+        };
+      }
+
+      const result = {
         repository: repo,
         success: true,
         packageJson: 'unchanged',
         message: `${targetPath} is already up to date`,
         dryRun
       };
+
+      // If stale PR was warned (author mismatch), attach warning info
+      if (stalePrResult && stalePrResult.action === 'warned') {
+        result.stalePrWarning = stalePrResult;
+      }
+
+      return result;
     }
 
     // Check if there's already an open PR for this update
@@ -2199,69 +2903,90 @@ export async function syncPackageJson(octokit, repo, packageJsonPath, syncScript
 }
 
 /**
- * Delete rulesets that are not in the managed list
- * @param {Octokit} octokit - Octokit instance
- * @param {string} owner - Repository owner
- * @param {string} repoName - Repository name
- * @param {Array} existingRulesets - List of existing rulesets in the repository
- * @param {string} managedRulesetName - Name of the ruleset being managed (to exclude from deletion)
- * @param {boolean} dryRun - Preview mode without making actual changes
- * @returns {Promise<Array>} Array of deletion results
+ * Parse a rulesets-file value into an array of file paths.
+ * Accepts a single string (comma-separated), a YAML array of strings,
+ * or an empty/falsy value (returns empty array).
+ * @param {string|string[]} value - The rulesets-file value from config
+ * @param {string} [context] - Context for error messages (e.g., repo name)
+ * @returns {string[]} Array of trimmed, non-empty file paths
  */
-async function deleteUnmanagedRulesetsHelper(octokit, owner, repoName, existingRulesets, managedRulesetName, dryRun) {
-  const rulesetsToDelete = existingRulesets.filter(r => r.name !== managedRulesetName);
-  const deletedRulesets = [];
-
-  for (const rulesetToDelete of rulesetsToDelete) {
-    if (dryRun) {
-      core.info(`  🗑️  Would delete ruleset "${rulesetToDelete.name}" (ID: ${rulesetToDelete.id})`);
-      deletedRulesets.push({
-        name: rulesetToDelete.name,
-        id: rulesetToDelete.id,
-        deleted: false,
-        wouldDelete: true
-      });
-    } else {
-      try {
-        await octokit.rest.repos.deleteRepoRuleset({
-          owner,
-          repo: repoName,
-          ruleset_id: rulesetToDelete.id
-        });
-        core.info(`  🗑️  Deleted ruleset "${rulesetToDelete.name}" (ID: ${rulesetToDelete.id})`);
-        deletedRulesets.push({
-          name: rulesetToDelete.name,
-          id: rulesetToDelete.id,
-          deleted: true
-        });
-      } catch (deleteError) {
-        core.warning(
-          `  ⚠️  Failed to delete ruleset "${rulesetToDelete.name}" (ID: ${rulesetToDelete.id}): ${deleteError.message}`
-        );
-        deletedRulesets.push({
-          name: rulesetToDelete.name,
-          id: rulesetToDelete.id,
-          deleted: false,
-          error: deleteError.message
-        });
-      }
-    }
+export function parseRulesetsFileValue(value, context) {
+  if (!value || (typeof value === 'string' && value.trim() === '') || (Array.isArray(value) && value.length === 0)) {
+    return [];
   }
 
-  return deletedRulesets;
+  const label = context ? ` for repo "${context}"` : '';
+  let paths;
+  if (Array.isArray(value)) {
+    paths = value.map(v => {
+      if (typeof v !== 'string' || v.trim() === '') {
+        throw new Error(`Invalid entry in "rulesets-file" array${label}: expected non-empty strings`);
+      }
+      return v.trim();
+    });
+  } else if (typeof value === 'string') {
+    paths = value
+      .split(',')
+      .map(p => p.trim())
+      .filter(p => p.length > 0);
+  } else {
+    throw new Error(`Invalid "rulesets-file"${label}: expected a string, comma-separated string, or array of strings`);
+  }
+
+  if (paths.length === 0) {
+    throw new Error(`Invalid "rulesets-file"${label}: no file paths provided`);
+  }
+
+  return paths;
 }
 
 /**
- * Sync repository ruleset to target repository
+ * Read-only fields returned by the GitHub API that must not be sent in
+ * PUT / POST requests.  Uses a blocklist so that any *new* writable fields
+ * GitHub adds are passed through without requiring an action update.
+ */
+export const RULESET_READONLY_FIELDS = new Set([
+  'id',
+  'node_id',
+  'source',
+  'source_type',
+  'created_at',
+  'updated_at',
+  '_links',
+  'current_user_can_bypass'
+]);
+
+/**
+ * Return a shallow copy of `config` with all read-only API fields removed.
+ * @param {Object} config - Ruleset configuration object
+ * @returns {Object} Cleaned configuration object
+ */
+export function stripRulesetReadonlyFields(config) {
+  const result = {};
+  for (const [key, value] of Object.entries(config)) {
+    if (!RULESET_READONLY_FIELDS.has(key)) {
+      result[key] = value;
+    }
+  }
+  return result;
+}
+
+/**
+ * Sync repository rulesets to target repository.
+ * Accepts an array of ruleset JSON file paths, processes each one,
+ * and handles delete-unmanaged logic across all managed names.
+ * Continues processing on individual ruleset failures (warns instead of aborting).
  * @param {Octokit} octokit - Octokit instance
  * @param {string} repo - Repository in "owner/repo" format
- * @param {string} rulesetFilePath - Path to local ruleset JSON file
- * @param {boolean} deleteUnmanaged - Delete all other rulesets besides the one being synced
+ * @param {string[]} rulesetFilePaths - Paths to local ruleset JSON files
+ * @param {boolean} deleteUnmanaged - Delete all other rulesets besides those being synced
  * @param {boolean} dryRun - Preview mode without making actual changes
- * @returns {Promise<Object>} Result object
+ * @returns {Promise<Object>} Result object with subResults array
  */
-export async function syncRepositoryRuleset(octokit, repo, rulesetFilePath, deleteUnmanaged, dryRun) {
+export async function syncRepositoryRulesets(octokit, repo, rulesetFilePaths, deleteUnmanaged, dryRun) {
   const [owner, repoName] = repo.split('/');
+  const subResults = [];
+  const wouldPrefix = dryRun ? 'Would ' : '';
 
   if (!owner || !repoName) {
     return {
@@ -2272,250 +2997,300 @@ export async function syncRepositoryRuleset(octokit, repo, rulesetFilePath, dele
     };
   }
 
-  try {
-    // Read the source ruleset JSON file
+  if (!rulesetFilePaths || rulesetFilePaths.length === 0) {
+    return {
+      repository: repo,
+      success: true,
+      ruleset: 'unchanged',
+      message: 'No ruleset files specified',
+      subResults: [],
+      dryRun
+    };
+  }
+
+  // Read and parse all ruleset JSON files upfront
+  const rulesetConfigs = [];
+  for (const filePath of rulesetFilePaths) {
     let rulesetConfig;
     try {
-      const fileContent = fs.readFileSync(rulesetFilePath, 'utf8');
+      const fileContent = fs.readFileSync(filePath, 'utf8');
       rulesetConfig = JSON.parse(fileContent);
     } catch (error) {
       return {
         repository: repo,
         success: false,
-        error: `Failed to read or parse ruleset file at ${rulesetFilePath}: ${error.message}`,
+        error: `Failed to read or parse ruleset file at ${filePath}: ${error.message}`,
         dryRun
       };
     }
 
-    // Validate that the ruleset has a name
     if (!rulesetConfig.name) {
       return {
         repository: repo,
         success: false,
-        error: 'Ruleset configuration must include a "name" field.',
+        error: `Ruleset configuration in "${filePath}" must include a "name" field.`,
         dryRun
       };
     }
 
-    const rulesetName = rulesetConfig.name;
+    rulesetConfigs.push(rulesetConfig);
+  }
 
-    // Get existing rulesets for the repository
-    let existingRulesets = [];
-    try {
-      const { data } = await octokit.rest.repos.getRepoRulesets({
-        owner,
-        repo: repoName
-      });
-      existingRulesets = data;
-    } catch (error) {
-      // If we get a 404, the repository might not have rulesets enabled
-      if (error.status === 404) {
-        core.info(`  📋 Repository ${repo} does not have rulesets enabled or accessible`);
-      } else {
-        throw error;
-      }
+  // Validate no duplicate ruleset names across files
+  const nameCount = new Map();
+  for (const config of rulesetConfigs) {
+    nameCount.set(config.name, (nameCount.get(config.name) || 0) + 1);
+  }
+  const duplicates = [...nameCount.entries()].filter(([, count]) => count > 1).map(([name]) => name);
+  if (duplicates.length > 0) {
+    return {
+      repository: repo,
+      success: false,
+      error: `Duplicate ruleset name(s) found across files: ${duplicates.join(', ')}. Each ruleset file must have a unique name.`,
+      dryRun
+    };
+  }
+
+  // Collect managed names for delete-unmanaged logic
+  const managedNames = new Set(rulesetConfigs.map(r => r.name));
+
+  // Get existing rulesets for the repository (once for all files)
+  // Use includes_parents=false to exclude organization-level rulesets
+  let existingRulesets = [];
+  try {
+    existingRulesets = await octokit.paginate(octokit.rest.repos.getRepoRulesets, {
+      owner,
+      repo: repoName,
+      per_page: 100,
+      includes_parents: false
+    });
+  } catch (error) {
+    if (error.status === 404) {
+      core.info(`  📋 Repository ${repo} does not have rulesets enabled or accessible`);
+    } else {
+      return {
+        repository: repo,
+        success: false,
+        error: `Failed to sync ruleset: ${error.message}`,
+        dryRun
+      };
     }
+  }
 
-    // Check if a ruleset with the same name already exists
+  // Process each desired ruleset
+  for (const rulesetConfig of rulesetConfigs) {
+    const rulesetName = rulesetConfig.name;
     const existingRuleset = existingRulesets.find(r => r.name === rulesetName);
 
     if (existingRuleset) {
       // Fetch full ruleset details to compare
-      const { data: fullRuleset } = await octokit.rest.repos.getRepoRuleset({
-        owner,
-        repo: repoName,
-        ruleset_id: existingRuleset.id
-      });
+      let fullRuleset;
+      try {
+        ({ data: fullRuleset } = await octokit.rest.repos.getRepoRuleset({
+          owner,
+          repo: repoName,
+          ruleset_id: existingRuleset.id
+        }));
+      } catch (error) {
+        core.warning(`  ⚠️  Failed to fetch ruleset "${rulesetName}" (ID: ${existingRuleset.id}): ${error.message}`);
+        const warnSub = createSubResult(
+          'ruleset-update',
+          SubResultStatus.WARNING,
+          `Failed to fetch "${rulesetName}" (ID: ${existingRuleset.id}): ${error.message}`
+        );
+        warnSub.rulesetId = existingRuleset.id;
+        warnSub.rulesetName = rulesetName;
+        subResults.push(warnSub);
+        continue;
+      }
 
-      // Compare the existing ruleset with the new configuration
-      // Remove fields that are returned by the API but not part of the input config
-      const existingConfig = {
-        name: fullRuleset.name,
-        target: fullRuleset.target,
-        enforcement: fullRuleset.enforcement,
-        ...(fullRuleset.bypass_actors && { bypass_actors: fullRuleset.bypass_actors }),
-        ...(fullRuleset.conditions && { conditions: fullRuleset.conditions }),
-        rules: fullRuleset.rules
-      };
-
-      // Normalize the source config by removing API-only fields that shouldn't be compared
-      // This allows users to use raw API response JSON as their source config
-      const normalizedSourceConfig = {
-        name: rulesetConfig.name,
-        target: rulesetConfig.target,
-        enforcement: rulesetConfig.enforcement,
-        ...(rulesetConfig.bypass_actors && { bypass_actors: rulesetConfig.bypass_actors }),
-        ...(rulesetConfig.conditions && { conditions: rulesetConfig.conditions }),
-        rules: rulesetConfig.rules
-      };
-
-      // Deep comparison of the configurations
-      const configsMatch = JSON.stringify(existingConfig) === JSON.stringify(normalizedSourceConfig);
+      const existingConfig = stripRulesetReadonlyFields(fullRuleset);
+      const normalizedSourceConfig = stripRulesetReadonlyFields(rulesetConfig);
+      const configsMatch = deepEqual(existingConfig, normalizedSourceConfig);
 
       if (configsMatch) {
         core.info(`  📋 Ruleset "${rulesetName}" is already up to date`);
+      } else {
+        core.info(`  📋 ${wouldPrefix}Update ruleset: ${rulesetName} (ID: ${existingRuleset.id})`);
+        subResults.push(
+          createSubResult(
+            'ruleset-update',
+            SubResultStatus.CHANGED,
+            `${wouldPrefix}update "${rulesetName}" (ID: ${existingRuleset.id})`
+          )
+        );
+        subResults[subResults.length - 1].rulesetId = existingRuleset.id;
+        subResults[subResults.length - 1].rulesetName = rulesetName;
 
-        const result = {
-          repository: repo,
-          success: true,
-          ruleset: 'unchanged',
-          rulesetId: existingRuleset.id,
-          message: `Ruleset "${rulesetName}" is already up to date`,
-          dryRun
-        };
-
-        // Handle delete unmanaged rulesets
-        if (deleteUnmanaged) {
-          const deletedRulesets = await deleteUnmanagedRulesetsHelper(
-            octokit,
-            owner,
-            repoName,
-            existingRulesets,
-            rulesetName,
-            dryRun
-          );
-          if (deletedRulesets.length > 0) {
-            result.deletedRulesets = deletedRulesets;
+        if (!dryRun) {
+          try {
+            await octokit.rest.repos.updateRepoRuleset({
+              ...stripRulesetReadonlyFields(rulesetConfig),
+              owner,
+              repo: repoName,
+              ruleset_id: existingRuleset.id
+            });
+          } catch (error) {
+            core.warning(`  ⚠️  Failed to update ruleset "${rulesetName}": ${error.message}`);
+            const warnSub = createSubResult(
+              'ruleset-update',
+              SubResultStatus.WARNING,
+              `Failed to update "${rulesetName}": ${error.message}`
+            );
+            warnSub.rulesetId = existingRuleset.id;
+            warnSub.rulesetName = rulesetName;
+            subResults[subResults.length - 1] = warnSub;
           }
         }
-
-        return result;
       }
-
-      if (dryRun) {
-        const result = {
-          repository: repo,
-          success: true,
-          ruleset: 'would-update',
-          rulesetId: existingRuleset.id,
-          message: `Would update ruleset "${rulesetName}" (ID: ${existingRuleset.id})`,
-          dryRun
-        };
-
-        // Handle delete unmanaged rulesets in dry-run mode
-        if (deleteUnmanaged) {
-          const deletedRulesets = await deleteUnmanagedRulesetsHelper(
-            octokit,
-            owner,
-            repoName,
-            existingRulesets,
-            rulesetName,
-            dryRun
-          );
-          if (deletedRulesets.length > 0) {
-            result.deletedRulesets = deletedRulesets;
-          }
-        }
-
-        return result;
-      }
-
-      // Update existing ruleset
-      await octokit.rest.repos.updateRepoRuleset({
-        owner,
-        repo: repoName,
-        ruleset_id: existingRuleset.id,
-        ...rulesetConfig
-      });
-
-      core.info(`  📋 Updated ruleset "${rulesetName}" (ID: ${existingRuleset.id})`);
-
-      const result = {
-        repository: repo,
-        success: true,
-        ruleset: 'updated',
-        rulesetId: existingRuleset.id,
-        message: `Updated ruleset "${rulesetName}" (ID: ${existingRuleset.id})`,
-        dryRun
-      };
-
-      // Handle delete unmanaged rulesets
-      if (deleteUnmanaged) {
-        const deletedRulesets = await deleteUnmanagedRulesetsHelper(
-          octokit,
-          owner,
-          repoName,
-          existingRulesets,
-          rulesetName,
-          dryRun
-        );
-        if (deletedRulesets.length > 0) {
-          result.deletedRulesets = deletedRulesets;
-        }
-      }
-
-      return result;
-    }
-
-    if (dryRun) {
-      const result = {
-        repository: repo,
-        success: true,
-        ruleset: 'would-create',
-        message: `Would create ruleset "${rulesetName}"`,
-        dryRun
-      };
-
-      // Handle delete unmanaged rulesets in dry-run mode
-      if (deleteUnmanaged) {
-        const deletedRulesets = await deleteUnmanagedRulesetsHelper(
-          octokit,
-          owner,
-          repoName,
-          existingRulesets,
-          rulesetName,
-          dryRun
-        );
-        if (deletedRulesets.length > 0) {
-          result.deletedRulesets = deletedRulesets;
-        }
-      }
-
-      return result;
-    }
-
-    // Create new ruleset
-    const { data: newRuleset } = await octokit.rest.repos.createRepoRuleset({
-      owner,
-      repo: repoName,
-      ...rulesetConfig
-    });
-
-    core.info(`  📋 Created ruleset "${rulesetName}" (ID: ${newRuleset.id})`);
-
-    const result = {
-      repository: repo,
-      success: true,
-      ruleset: 'created',
-      rulesetId: newRuleset.id,
-      message: `Created ruleset "${rulesetName}" (ID: ${newRuleset.id})`,
-      dryRun
-    };
-
-    // Handle delete unmanaged rulesets
-    if (deleteUnmanaged) {
-      const deletedRulesets = await deleteUnmanagedRulesetsHelper(
-        octokit,
-        owner,
-        repoName,
-        existingRulesets,
-        rulesetName,
-        dryRun
+    } else {
+      core.info(`  🆕 ${wouldPrefix}Create ruleset: ${rulesetName}`);
+      const createSub = createSubResult(
+        'ruleset-create',
+        SubResultStatus.CHANGED,
+        `${wouldPrefix}create "${rulesetName}"`
       );
-      if (deletedRulesets.length > 0) {
-        result.deletedRulesets = deletedRulesets;
+      createSub.rulesetName = rulesetName;
+      subResults.push(createSub);
+
+      if (!dryRun) {
+        try {
+          const { data: newRuleset } = await octokit.rest.repos.createRepoRuleset({
+            ...stripRulesetReadonlyFields(rulesetConfig),
+            owner,
+            repo: repoName
+          });
+          core.info(`  📋 Created ruleset "${rulesetName}" (ID: ${newRuleset.id})`);
+          subResults[subResults.length - 1].rulesetId = newRuleset.id;
+        } catch (error) {
+          core.warning(`  ⚠️  Failed to create ruleset "${rulesetName}": ${error.message}`);
+          const warnSub = createSubResult(
+            'ruleset-create',
+            SubResultStatus.WARNING,
+            `Failed to create "${rulesetName}": ${error.message}`
+          );
+          warnSub.rulesetName = rulesetName;
+          subResults[subResults.length - 1] = warnSub;
+        }
       }
     }
-
-    return result;
-  } catch (error) {
-    return {
-      repository: repo,
-      success: false,
-      error: `Failed to sync ruleset: ${error.message}`,
-      dryRun
-    };
   }
+
+  // Delete unmanaged rulesets (those not in the managed set)
+  if (deleteUnmanaged) {
+    for (const existing of existingRulesets) {
+      if (!managedNames.has(existing.name)) {
+        core.info(`  🗑️ ${wouldPrefix}Delete ruleset: ${existing.name} (ID: ${existing.id})`);
+        const deleteSub = createSubResult(
+          'ruleset-delete',
+          SubResultStatus.CHANGED,
+          `${wouldPrefix}delete "${existing.name}" (ID: ${existing.id})`
+        );
+        deleteSub.rulesetName = existing.name;
+        deleteSub.rulesetId = existing.id;
+        subResults.push(deleteSub);
+
+        if (!dryRun) {
+          try {
+            await octokit.rest.repos.deleteRepoRuleset({
+              owner,
+              repo: repoName,
+              ruleset_id: existing.id
+            });
+          } catch (error) {
+            core.warning(`  ⚠️  Failed to delete ruleset "${existing.name}": ${error.message}`);
+            const warnSub = createSubResult(
+              'ruleset-delete',
+              SubResultStatus.WARNING,
+              `Failed to delete "${existing.name}": ${error.message}`
+            );
+            warnSub.rulesetName = existing.name;
+            warnSub.rulesetId = existing.id;
+            subResults[subResults.length - 1] = warnSub;
+          }
+        }
+      }
+    }
+  }
+
+  // Build backward-compatible result
+  const hasChanges = subResults.some(s => s.status === SubResultStatus.CHANGED);
+  const hasWarnings = subResults.some(s => s.status === SubResultStatus.WARNING);
+
+  // Determine aggregate status from non-delete operations
+  const syncSubResults = subResults.filter(s => s.kind !== 'ruleset-delete');
+  const hasSyncChanges = syncSubResults.some(s => s.status === SubResultStatus.CHANGED);
+
+  let ruleset = 'unchanged';
+  let message = `All ${rulesetConfigs.length} ruleset(s) are already up to date`;
+
+  if (hasSyncChanges) {
+    const firstChanged = syncSubResults.find(s => s.status === SubResultStatus.CHANGED);
+    if (firstChanged.kind === 'ruleset-create') {
+      ruleset = dryRun ? 'would-create' : 'created';
+    } else {
+      ruleset = dryRun ? 'would-update' : 'updated';
+    }
+  }
+
+  if (hasChanges || hasWarnings) {
+    const messages = subResults.map(s => s.message);
+    message = messages.join('; ');
+  }
+
+  const result = {
+    repository: repo,
+    success: true,
+    ruleset,
+    message,
+    subResults,
+    dryRun
+  };
+
+  // Preserve rulesetId for backward compat
+  const firstCreateOrUpdate = subResults.find(
+    s => (s.kind === 'ruleset-create' || s.kind === 'ruleset-update') && s.rulesetId
+  );
+  if (firstCreateOrUpdate) {
+    result.rulesetId = firstCreateOrUpdate.rulesetId;
+  } else if (rulesetConfigs.length > 0) {
+    // For unchanged rulesets, find the existing ID
+    const firstExisting = existingRulesets.find(r => managedNames.has(r.name));
+    if (firstExisting) {
+      result.rulesetId = firstExisting.id;
+    }
+  }
+
+  // Preserve deletedRulesets for backward compat
+  const deleteSubResults = subResults.filter(s => s.kind === 'ruleset-delete');
+  if (deleteSubResults.length > 0) {
+    result.deletedRulesets = deleteSubResults.map(s => {
+      const isWarning = s.status === SubResultStatus.WARNING;
+      const isDryRun = s.message.startsWith('Would');
+      return {
+        name: s.rulesetName,
+        id: s.rulesetId,
+        deleted: !isWarning && !isDryRun,
+        ...(isDryRun && { wouldDelete: true }),
+        ...(isWarning && { error: s.message })
+      };
+    });
+  }
+
+  return result;
+}
+
+/**
+ * Sync a single repository ruleset to target repository (backward-compatible wrapper).
+ * @param {Octokit} octokit - Octokit instance
+ * @param {string} repo - Repository in "owner/repo" format
+ * @param {string} rulesetFilePath - Path to local ruleset JSON file
+ * @param {boolean} deleteUnmanaged - Delete all other rulesets besides the one being synced
+ * @param {boolean} dryRun - Preview mode without making actual changes
+ * @returns {Promise<Object>} Result object
+ */
+export async function syncRepositoryRuleset(octokit, repo, rulesetFilePath, deleteUnmanaged, dryRun) {
+  return syncRepositoryRulesets(octokit, repo, [rulesetFilePath], deleteUnmanaged, dryRun);
 }
 
 /**
@@ -2525,9 +3300,10 @@ export async function syncRepositoryRuleset(octokit, repo, rulesetFilePath, dele
  * @param {string} templatePath - Path to local pull request template file
  * @param {string} prTitle - Title for the pull request
  * @param {boolean} dryRun - Preview mode without making actual changes
+ * @param {string} [authenticatedLogin] - Login of the authenticated user/app for stale PR matching
  * @returns {Promise<Object>} Result object
  */
-export async function syncPullRequestTemplate(octokit, repo, templatePath, prTitle, dryRun) {
+export async function syncPullRequestTemplate(octokit, repo, templatePath, prTitle, dryRun, authenticatedLogin) {
   return syncFileViaPullRequest(
     octokit,
     repo,
@@ -2539,7 +3315,8 @@ export async function syncPullRequestTemplate(octokit, repo, templatePath, prTit
       prBodyCreate: `This PR adds \`.github/pull_request_template.md\` to standardize pull requests.\n\n**Changes:**\n- Added pull request template`,
       prBodyUpdate: `This PR updates \`.github/pull_request_template.md\` to the latest version.\n\n**Changes:**\n- Updated pull request template`,
       resultKey: 'pullRequestTemplate',
-      fileDescription: 'pull request template'
+      fileDescription: 'pull request template',
+      authenticatedLogin
     },
     dryRun
   );
@@ -2552,9 +3329,10 @@ export async function syncPullRequestTemplate(octokit, repo, templatePath, prTit
  * @param {Array<string>} workflowFilePaths - Array of local workflow file paths to sync
  * @param {string} prTitle - Title for the pull request
  * @param {boolean} dryRun - Preview mode without making actual changes
+ * @param {string} [authenticatedLogin] - Login of the authenticated user/app for stale PR matching
  * @returns {Promise<Object>} Result object
  */
-export async function syncWorkflowFiles(octokit, repo, workflowFilePaths, prTitle, dryRun) {
+export async function syncWorkflowFiles(octokit, repo, workflowFilePaths, prTitle, dryRun, authenticatedLogin) {
   // Validate that workflow files array is non-empty
   if (!workflowFilePaths || workflowFilePaths.length === 0) {
     return {
@@ -2581,7 +3359,8 @@ export async function syncWorkflowFiles(octokit, repo, workflowFilePaths, prTitl
       prBodyCreate: 'This PR adds workflow files.',
       prBodyUpdate: 'This PR syncs workflow files to the latest versions.',
       resultKey: 'workflowFiles',
-      fileDescription: 'workflow files'
+      fileDescription: 'workflow files',
+      authenticatedLogin
     },
     dryRun
   );
@@ -2779,15 +3558,939 @@ export async function syncAutolinks(octokit, repo, autolinksFilePath, dryRun) {
 }
 
 /**
+ * Normalize an existing environment from the API response into a comparable format.
+ * Extracts wait_timer and reviewers from protection_rules.
+ * @param {Object} env - Environment object from the API
+ * @returns {Object} Normalized environment settings
+ */
+export function normalizeExistingEnvironment(env) {
+  const normalized = {
+    name: env.name,
+    wait_timer: 0,
+    prevent_self_review: false,
+    reviewers: [],
+    deployment_branch_policy: env.deployment_branch_policy ?? null
+  };
+
+  if (Array.isArray(env.protection_rules)) {
+    for (const rule of env.protection_rules) {
+      if (rule.type === 'wait_timer') {
+        normalized.wait_timer = rule.wait_timer ?? 0;
+      } else if (rule.type === 'required_reviewers') {
+        if (Array.isArray(rule.reviewers)) {
+          normalized.reviewers = rule.reviewers.map(r => ({
+            type: r.type,
+            id: r.reviewer?.id
+          }));
+        }
+        normalized.prevent_self_review = rule.prevent_self_review ?? false;
+      }
+    }
+  }
+
+  // Sort reviewers by type and id for consistent comparison
+  normalized.reviewers.sort((a, b) => {
+    if (a.type !== b.type) return a.type.localeCompare(b.type);
+    return (a.id ?? 0) - (b.id ?? 0);
+  });
+
+  return normalized;
+}
+
+/**
+ * Resolve a reviewer entry to include a numeric ID.
+ * If the reviewer has a `login` (User) or `slug` (Team), resolves to the numeric ID via API.
+ * @param {Octokit} octokit - Octokit instance
+ * @param {string} owner - Repository/org owner
+ * @param {Object} reviewer - Reviewer object with type and either id, login, or slug
+ * @param {Map} [cache] - Optional cache for resolved reviewer IDs
+ * @returns {Promise<Object>} Reviewer with resolved id
+ */
+async function resolveReviewer(octokit, owner, reviewer, cache) {
+  if (reviewer.id !== undefined && reviewer.id !== null) {
+    const numId = Number(reviewer.id);
+    if (!Number.isFinite(numId) || numId <= 0) {
+      throw new Error(`Invalid reviewer id "${reviewer.id}": must be a positive number`);
+    }
+    return { type: reviewer.type, id: numId };
+  }
+
+  // Include owner in team cache key since team slugs are org-scoped
+  const cacheKey = reviewer.type === 'Team' ? `Team:${owner}:${reviewer.slug}` : `User:${reviewer.login}`;
+  if (cache?.has(cacheKey)) return cache.get(cacheKey);
+
+  if (reviewer.type === 'User' && reviewer.login) {
+    try {
+      const { data } = await octokit.rest.users.getByUsername({ username: reviewer.login });
+      const result = { type: 'User', id: data.id };
+      cache?.set(cacheKey, result);
+      return result;
+    } catch (error) {
+      throw new Error(`Failed to resolve User login "${reviewer.login}": ${error.message}`);
+    }
+  }
+
+  if (reviewer.type === 'Team' && reviewer.slug) {
+    try {
+      const { data } = await octokit.rest.teams.getByName({ org: owner, team_slug: reviewer.slug });
+      const result = { type: 'Team', id: data.id };
+      cache?.set(cacheKey, result);
+      return result;
+    } catch (error) {
+      throw new Error(`Failed to resolve Team slug "${reviewer.slug}" in org "${owner}": ${error.message}`);
+    }
+  }
+
+  throw new Error(
+    `Reviewer must have an "id", or "login" (for User) / "slug" (for Team). Got: ${JSON.stringify(reviewer)}`
+  );
+}
+
+/**
+ * Resolve all reviewers in an environment config, converting friendly names to IDs.
+ * @param {Octokit} octokit - Octokit instance
+ * @param {string} owner - Repository/org owner
+ * @param {Array<Object>} reviewers - Array of reviewer objects
+ * @param {Map} [cache] - Optional cache for resolved reviewer IDs
+ * @returns {Promise<Array<Object>>} Reviewers with resolved IDs
+ */
+async function resolveReviewers(octokit, owner, reviewers, cache) {
+  if (!reviewers || reviewers.length === 0) return [];
+  return Promise.all(reviewers.map(r => resolveReviewer(octokit, owner, r, cache)));
+}
+
+/**
+ * Sync deployment protection rules for an environment.
+ * @param {Octokit} octokit - Octokit instance
+ * @param {string} owner - Repository owner
+ * @param {string} repoName - Repository name
+ * @param {string} envName - Environment name
+ * @param {Array<Object>} desiredRules - Desired protection rules (each with `app` slug)
+ * @param {boolean} dryRun - Preview mode
+ * @returns {Promise<Array<Object>>} Array of subResults for rule operations
+ */
+async function syncDeploymentProtectionRules(octokit, owner, repoName, envName, desiredRules, dryRun) {
+  const subResults = [];
+  const wouldPrefix = dryRun ? 'Would ' : '';
+
+  if (!Array.isArray(desiredRules)) {
+    core.warning(`  ⚠️  Invalid deployment_protection_rules for ${envName}: expected an array`);
+    subResults.push(
+      createSubResult(
+        'environment-protection-rule',
+        SubResultStatus.WARNING,
+        `Invalid deployment_protection_rules for ${envName}`
+      )
+    );
+    return subResults;
+  }
+
+  // Get available apps for this environment (only needed when there are desired rules to resolve)
+  let availableApps = [];
+  if (desiredRules.length > 0) {
+    try {
+      const { data } = await octokit.request(
+        'GET /repos/{owner}/{repo}/environments/{environment_name}/deployment_protection_rules/apps',
+        { owner, repo: repoName, environment_name: envName }
+      );
+      availableApps = data.available_custom_deployment_protection_rule_integrations ?? [];
+    } catch (error) {
+      core.warning(`  ⚠️  Failed to list available deployment protection rule apps for ${envName}: ${error.message}`);
+      subResults.push(
+        createSubResult(
+          'environment-protection-rule',
+          SubResultStatus.WARNING,
+          `Failed to list deployment protection rule apps for ${envName}`
+        )
+      );
+      return subResults;
+    }
+  }
+
+  // Resolve app slugs to integration IDs (deduplicate by slug)
+  const resolvedRules = [];
+  const seenSlugs = new Set();
+  for (const rule of desiredRules) {
+    if (!rule || typeof rule !== 'object' || Array.isArray(rule) || typeof rule.app !== 'string' || !rule.app.trim()) {
+      core.warning(
+        `  ⚠️  Invalid deployment protection rule for ${envName}: expected an object with a non-empty "app" string`
+      );
+      subResults.push(
+        createSubResult(
+          'environment-protection-rule',
+          SubResultStatus.WARNING,
+          `Invalid deployment protection rule for ${envName}`
+        )
+      );
+      continue;
+    }
+    const appSlug = rule.app.trim();
+    if (seenSlugs.has(appSlug)) continue;
+    seenSlugs.add(appSlug);
+    const app = availableApps.find(a => a.slug === appSlug);
+    if (!app) {
+      core.warning(
+        `  ⚠️  Deployment protection rule app "${appSlug}" not found for environment ${envName}. ` +
+          `Available apps: ${availableApps.map(a => a.slug).join(', ') || 'none'}`
+      );
+      subResults.push(
+        createSubResult(
+          'environment-protection-rule',
+          SubResultStatus.WARNING,
+          `App "${appSlug}" not available for ${envName}`
+        )
+      );
+      continue;
+    }
+    resolvedRules.push({ integration_id: app.id, slug: appSlug });
+  }
+
+  // Get existing protection rules
+  let existingRules = [];
+  try {
+    const { data } = await octokit.request(
+      'GET /repos/{owner}/{repo}/environments/{environment_name}/deployment_protection_rules',
+      { owner, repo: repoName, environment_name: envName }
+    );
+    existingRules = data.custom_deployment_protection_rules ?? [];
+  } catch (error) {
+    core.warning(`  ⚠️  Failed to list deployment protection rules for ${envName}: ${error.message}`);
+    subResults.push(
+      createSubResult(
+        'environment-protection-rule',
+        SubResultStatus.WARNING,
+        `Failed to list deployment protection rules for ${envName}: ${error.message}`
+      )
+    );
+    return subResults;
+  }
+
+  const existingAppIds = new Set(existingRules.map(r => r.app?.id));
+  const desiredAppIds = new Set(resolvedRules.map(r => r.integration_id));
+
+  // Create missing rules
+  for (const rule of resolvedRules) {
+    if (!existingAppIds.has(rule.integration_id)) {
+      core.info(`  🛡️ ${wouldPrefix}Add deployment gate: ${rule.slug}`);
+      subResults.push(
+        createSubResult(
+          'environment-protection-rule',
+          SubResultStatus.CHANGED,
+          `${wouldPrefix}add deployment gate "${rule.slug}" to ${envName}`
+        )
+      );
+      if (!dryRun) {
+        try {
+          await octokit.request(
+            'POST /repos/{owner}/{repo}/environments/{environment_name}/deployment_protection_rules',
+            { owner, repo: repoName, environment_name: envName, integration_id: rule.integration_id }
+          );
+        } catch (error) {
+          core.warning(`  ⚠️  Failed to add deployment gate "${rule.slug}": ${error.message}`);
+          subResults[subResults.length - 1] = createSubResult(
+            'environment-protection-rule',
+            SubResultStatus.WARNING,
+            `Failed to add deployment gate "${rule.slug}": ${error.message}`
+          );
+        }
+      }
+    }
+  }
+
+  // Delete rules not in desired set (skip if all desired rules failed validation — avoids accidental delete-all)
+  const hasValidationFailures = subResults.some(s => s.status === SubResultStatus.WARNING);
+  if (desiredRules.length > 0 && resolvedRules.length === 0 && hasValidationFailures) {
+    core.warning(
+      `  ⚠️  All deployment protection rules for ${envName} failed validation — skipping deletion to avoid accidental removal`
+    );
+    return subResults;
+  }
+  for (const existing of existingRules) {
+    if (existing.app?.id && !desiredAppIds.has(existing.app.id)) {
+      const appSlug = existing.app?.slug ?? `ID ${existing.app?.id}`;
+      core.info(`  🗑️ ${wouldPrefix}Remove deployment gate: ${appSlug}`);
+      subResults.push(
+        createSubResult(
+          'environment-protection-rule',
+          SubResultStatus.CHANGED,
+          `${wouldPrefix}remove deployment gate "${appSlug}" from ${envName}`
+        )
+      );
+      if (!dryRun) {
+        try {
+          await octokit.request(
+            'DELETE /repos/{owner}/{repo}/environments/{environment_name}/deployment_protection_rules/{protection_rule_id}',
+            { owner, repo: repoName, environment_name: envName, protection_rule_id: existing.id }
+          );
+        } catch (error) {
+          core.warning(`  ⚠️  Failed to remove deployment gate "${appSlug}": ${error.message}`);
+          subResults[subResults.length - 1] = createSubResult(
+            'environment-protection-rule',
+            SubResultStatus.WARNING,
+            `Failed to remove deployment gate "${appSlug}": ${error.message}`
+          );
+        }
+      }
+    }
+  }
+
+  return subResults;
+}
+
+export function normalizeDesiredEnvironment(env) {
+  const normalized = {
+    name: env.name,
+    wait_timer: env.wait_timer ?? 0,
+    prevent_self_review: env.prevent_self_review ?? false,
+    reviewers: (env.reviewers ?? []).map(r => ({ type: r.type, id: r.id })),
+    deployment_branch_policy: env.deployment_branch_policy ?? null
+  };
+
+  // Sort reviewers by type and id for consistent comparison
+  normalized.reviewers.sort((a, b) => {
+    if (a.type !== b.type) return a.type.localeCompare(b.type);
+    return (a.id ?? 0) - (b.id ?? 0);
+  });
+
+  return normalized;
+}
+
+/**
+ * Compare two arrays of reviewer objects for equality.
+ * Assumes both arrays are already sorted by type and id.
+ * @param {Array} a - First reviewers array
+ * @param {Array} b - Second reviewers array
+ * @returns {boolean} True if reviewers are equal
+ */
+function reviewersEqual(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i].type !== b[i].type || a[i].id !== b[i].id) return false;
+  }
+  return true;
+}
+
+/**
+ * Sync custom deployment branch policies (name patterns) for an environment.
+ * Only runs when custom_branch_policies is true in the environment config.
+ * @param {Octokit} octokit - Octokit instance
+ * @param {string} owner - Repository owner
+ * @param {string} repoName - Repository name
+ * @param {string} envName - Environment name
+ * @param {Array<string>} desiredPatterns - Desired branch/tag name patterns
+ * @param {boolean} dryRun - Preview mode
+ * @returns {Promise<Array<Object>>} Array of subResults
+ */
+async function syncDeploymentBranchPolicies(octokit, owner, repoName, envName, desiredPatterns, dryRun) {
+  const subResults = [];
+  const wouldPrefix = dryRun ? 'Would ' : '';
+
+  // Normalize desired patterns: validate strings, trim, filter empty, deduplicate
+  const normalizedPatterns = [];
+  const seenPatterns = new Set();
+  for (const pattern of desiredPatterns) {
+    if (typeof pattern !== 'string') {
+      core.warning(
+        `  ⚠️  Skipping invalid branch policy pattern for ${envName}: expected string but got ${pattern === null ? 'null' : typeof pattern}`
+      );
+      continue;
+    }
+    const trimmed = pattern.trim();
+    if (trimmed.length === 0 || seenPatterns.has(trimmed)) continue;
+    seenPatterns.add(trimmed);
+    normalizedPatterns.push(trimmed);
+  }
+
+  // Get existing branch policies
+  let existingPolicies = [];
+  try {
+    const { data } = await octokit.request(
+      'GET /repos/{owner}/{repo}/environments/{environment_name}/deployment-branch-policies',
+      { owner, repo: repoName, environment_name: envName }
+    );
+    existingPolicies = data.branch_policies ?? [];
+  } catch (error) {
+    core.warning(`  ⚠️  Failed to list deployment branch policies for ${envName}: ${error.message}`);
+    subResults.push(
+      createSubResult(
+        'environment-branch-policy',
+        SubResultStatus.WARNING,
+        `Failed to list deployment branch policies for ${envName}`
+      )
+    );
+    return subResults;
+  }
+
+  const existingNames = new Set(existingPolicies.map(p => p.name));
+  const desiredNames = new Set(normalizedPatterns);
+
+  // Create missing policies
+  for (const pattern of normalizedPatterns) {
+    if (!existingNames.has(pattern)) {
+      core.info(`  🌿 ${wouldPrefix}Add branch policy: ${pattern} to ${envName}`);
+      if (!dryRun) {
+        try {
+          await octokit.request(
+            'POST /repos/{owner}/{repo}/environments/{environment_name}/deployment-branch-policies',
+            {
+              owner,
+              repo: repoName,
+              environment_name: envName,
+              name: pattern
+            }
+          );
+          subResults.push(
+            createSubResult(
+              'environment-branch-policy',
+              SubResultStatus.CHANGED,
+              `${wouldPrefix}add branch policy "${pattern}" to ${envName}`
+            )
+          );
+        } catch (error) {
+          core.warning(`  ⚠️  Failed to add branch policy "${pattern}" to ${envName}: ${error.message}`);
+          subResults.push(
+            createSubResult(
+              'environment-branch-policy',
+              SubResultStatus.WARNING,
+              `Failed to add branch policy "${pattern}" to ${envName}`
+            )
+          );
+        }
+      } else {
+        subResults.push(
+          createSubResult(
+            'environment-branch-policy',
+            SubResultStatus.CHANGED,
+            `${wouldPrefix}add branch policy "${pattern}" to ${envName}`
+          )
+        );
+      }
+    }
+  }
+
+  // Delete policies not in desired list (skip if all patterns were invalid — avoids accidental delete-all)
+  if (desiredPatterns.length > 0 && normalizedPatterns.length === 0) {
+    core.warning(
+      `  ⚠️  All branch name patterns for ${envName} were invalid — skipping deletion to avoid accidental removal`
+    );
+    return subResults;
+  }
+  for (const policy of existingPolicies) {
+    if (!desiredNames.has(policy.name)) {
+      core.info(`  🌿 ${wouldPrefix}Remove branch policy: ${policy.name} from ${envName}`);
+      if (!dryRun) {
+        try {
+          await octokit.request(
+            'DELETE /repos/{owner}/{repo}/environments/{environment_name}/deployment-branch-policies/{branch_policy_id}',
+            { owner, repo: repoName, environment_name: envName, branch_policy_id: policy.id }
+          );
+          subResults.push(
+            createSubResult(
+              'environment-branch-policy',
+              SubResultStatus.CHANGED,
+              `${wouldPrefix}remove branch policy "${policy.name}" from ${envName}`
+            )
+          );
+        } catch (error) {
+          core.warning(`  ⚠️  Failed to remove branch policy "${policy.name}" from ${envName}: ${error.message}`);
+          subResults.push(
+            createSubResult(
+              'environment-branch-policy',
+              SubResultStatus.WARNING,
+              `Failed to remove branch policy "${policy.name}" from ${envName}`
+            )
+          );
+        }
+      } else {
+        subResults.push(
+          createSubResult(
+            'environment-branch-policy',
+            SubResultStatus.CHANGED,
+            `${wouldPrefix}remove branch policy "${policy.name}" from ${envName}`
+          )
+        );
+      }
+    }
+  }
+
+  return subResults;
+}
+
+/**
+ * Compare two deployment branch policy objects for equality.
+ * @param {Object|null} a - First branch policy
+ * @param {Object|null} b - Second branch policy
+ * @returns {boolean} True if branch policies are equal
+ */
+function branchPoliciesEqual(a, b) {
+  if (a === null && b === null) return true;
+  if (a === null || b === null) return false;
+  return a.protected_branches === b.protected_branches && a.custom_branch_policies === b.custom_branch_policies;
+}
+
+/**
+ * Compare two normalized environments for equality.
+ * @param {Object} a - First normalized environment
+ * @param {Object} b - Second normalized environment
+ * @returns {boolean} True if environments have the same settings
+ */
+export function environmentsEqual(a, b) {
+  if (a.wait_timer !== b.wait_timer) return false;
+  if (a.prevent_self_review !== b.prevent_self_review) return false;
+  if (!reviewersEqual(a.reviewers, b.reviewers)) return false;
+  if (!branchPoliciesEqual(a.deployment_branch_policy, b.deployment_branch_policy)) return false;
+  return true;
+}
+
+/**
+ * Build PUT request parameters for creating or updating an environment.
+ * @param {string} owner - Repository owner
+ * @param {string} repoName - Repository name
+ * @param {Object} env - Environment config object
+ * @returns {Object} Request parameters
+ */
+function buildEnvironmentParams(owner, repoName, env) {
+  const params = {
+    owner,
+    repo: repoName,
+    environment_name: env.name,
+    wait_timer: env.wait_timer ?? 0,
+    prevent_self_review: env.prevent_self_review ?? false,
+    reviewers: env.reviewers ?? [],
+    deployment_branch_policy: env.deployment_branch_policy ?? null
+  };
+  return params;
+}
+
+/**
+ * Parse environments configuration from various input formats.
+ * Accepts a comma-separated string of names, a YAML/JSON file path, or both.
+ * @param {string} [environmentNames] - Comma-separated environment names (inline input)
+ * @param {string} [environmentsFilePath] - Path to YAML or JSON environments config file
+ * @returns {Array<Object>} Array of environment config objects (each with at least a name)
+ */
+export function parseEnvironmentsConfig(environmentNames, environmentsFilePath) {
+  const environments = [];
+
+  // Parse inline environment names (simple comma-separated list, deduplicated)
+  if (environmentNames) {
+    const names = [
+      ...new Set(
+        environmentNames
+          .split(',')
+          .map(n => n.trim())
+          .filter(n => n.length > 0)
+      )
+    ];
+    for (const name of names) {
+      environments.push({ name, _nameOnly: true });
+    }
+  }
+
+  // Parse environments file (YAML or JSON)
+  if (environmentsFilePath) {
+    const fileContent = fs.readFileSync(environmentsFilePath, 'utf8');
+    let parsed;
+
+    // Try YAML first, fall back to JSON
+    try {
+      parsed = yaml.load(fileContent);
+    } catch (yamlError) {
+      try {
+        parsed = JSON.parse(fileContent);
+      } catch (jsonError) {
+        throw new Error(
+          `Failed to parse environments config file "${environmentsFilePath}" as YAML or JSON. ` +
+            `YAML error: ${yamlError.message}. JSON error: ${jsonError.message}`
+        );
+      }
+    }
+
+    const fileEnvs = Array.isArray(parsed?.environments) ? parsed.environments : Array.isArray(parsed) ? parsed : [];
+    if (fileEnvs.length === 0) {
+      throw new Error(
+        `Environments config file "${environmentsFilePath}" must contain an "environments" array or be a YAML/JSON array`
+      );
+    }
+
+    // Validate and normalize environment names from file
+    for (const env of fileEnvs) {
+      if (!env || typeof env !== 'object' || Array.isArray(env)) {
+        throw new Error(`Each entry in "${environmentsFilePath}" must be an object with a "name" field`);
+      }
+      if (!env.name || typeof env.name !== 'string') {
+        throw new Error(`Each environment in "${environmentsFilePath}" must have a "name" field`);
+      }
+      env.name = env.name.trim();
+      if (env.name.length === 0) {
+        throw new Error(`Environment name in "${environmentsFilePath}" cannot be empty or whitespace`);
+      }
+    }
+
+    // Check for duplicate names within the file (after trimming)
+    const fileNames = fileEnvs.map(e => e.name);
+    const fileDuplicates = fileNames.filter((name, idx) => fileNames.indexOf(name) !== idx);
+    if (fileDuplicates.length > 0) {
+      throw new Error(
+        `Duplicate environment name(s) in "${environmentsFilePath}": ${[...new Set(fileDuplicates)].join(', ')}`
+      );
+    }
+
+    // File environments override inline ones with the same name
+    const inlineNames = new Set(environments.map(e => e.name));
+    for (const env of fileEnvs) {
+      if (inlineNames.has(env.name)) {
+        // Replace inline entry with richer file entry
+        const idx = environments.findIndex(e => e.name === env.name);
+        environments[idx] = env;
+      } else {
+        environments.push(env);
+      }
+    }
+  }
+
+  return environments;
+}
+
+/**
+ * Sync environments to target repository
+ * @param {Octokit} octokit - Octokit instance
+ * @param {string} repo - Repository in "owner/repo" format
+ * @param {Array<Object>} environmentsList - Array of environment config objects
+ * @param {boolean} deleteUnmanaged - Delete environments not in the config
+ * @param {boolean} dryRun - Preview mode without making actual changes
+ * @param {Map} [reviewerCache] - Optional cache for resolved reviewer IDs
+ * @returns {Promise<Object>} Result object
+ */
+export async function syncEnvironments(octokit, repo, environmentsList, deleteUnmanaged, dryRun, reviewerCache) {
+  const [owner, repoName] = repo.split('/');
+
+  if (!owner || !repoName) {
+    return {
+      repository: repo,
+      success: false,
+      error: 'Invalid repository format. Expected "owner/repo"',
+      dryRun
+    };
+  }
+
+  try {
+    // Validate each environment entry has a name
+    for (const env of environmentsList) {
+      if (!env.name || typeof env.name !== 'string') {
+        return {
+          repository: repo,
+          success: false,
+          error: 'Each environment must have a "name" field.',
+          dryRun
+        };
+      }
+    }
+
+    // Resolve reviewer friendly names to IDs
+    const resolvedEnvironments = [];
+    for (const env of environmentsList) {
+      const resolved = { ...env };
+      if (resolved.reviewers && !Array.isArray(resolved.reviewers)) {
+        return {
+          repository: repo,
+          success: false,
+          error: `Invalid reviewers for environment "${env.name}": expected an array`,
+          dryRun
+        };
+      }
+      if (Array.isArray(resolved.reviewers) && resolved.reviewers.length > 0) {
+        try {
+          resolved.reviewers = await resolveReviewers(octokit, owner, resolved.reviewers, reviewerCache);
+        } catch (error) {
+          return {
+            repository: repo,
+            success: false,
+            error: `Failed to resolve reviewers for environment "${env.name}": ${error.message}`,
+            dryRun
+          };
+        }
+      }
+      resolvedEnvironments.push(resolved);
+    }
+
+    // Get existing environments for the repository (paginated)
+    const existingEnvironments = [];
+    try {
+      let page = 1;
+      const perPage = 100;
+      let hasMore = true;
+      while (hasMore) {
+        const response = await octokit.request('GET /repos/{owner}/{repo}/environments', {
+          owner,
+          repo: repoName,
+          per_page: perPage,
+          page
+        });
+        const envs = response.data.environments ?? [];
+        existingEnvironments.push(...envs);
+        hasMore = envs.length === perPage;
+        page++;
+      }
+    } catch (error) {
+      if (error.status === 404) {
+        core.info(`  🌍 Repository ${repo} does not have environments accessible`);
+      } else {
+        throw error;
+      }
+    }
+
+    // Normalize environments for comparison
+    const normalizedExisting = new Map(existingEnvironments.map(env => [env.name, normalizeExistingEnvironment(env)]));
+
+    const environmentsToCreate = [];
+    const environmentsToUpdate = [];
+    const environmentsUnchanged = [];
+    const environmentsToDelete = [];
+
+    // Compare desired with existing
+    for (const desiredEnv of resolvedEnvironments) {
+      const normalizedDesired = normalizeDesiredEnvironment(desiredEnv);
+      const existing = normalizedExisting.get(desiredEnv.name);
+
+      if (!existing) {
+        environmentsToCreate.push(normalizedDesired);
+      } else if (desiredEnv._nameOnly) {
+        // Simple mode (name-only): don't update existing environments, just ensure they exist
+        environmentsUnchanged.push(normalizedDesired);
+      } else if (!environmentsEqual(normalizedDesired, existing)) {
+        environmentsToUpdate.push(normalizedDesired);
+      } else {
+        environmentsUnchanged.push(normalizedDesired);
+      }
+    }
+
+    // Find environments to delete (exist in repo but not in config)
+    if (deleteUnmanaged) {
+      const desiredNames = new Set(resolvedEnvironments.map(e => e.name));
+      for (const existingEnv of existingEnvironments) {
+        if (!desiredNames.has(existingEnv.name)) {
+          environmentsToDelete.push(existingEnv);
+        }
+      }
+    }
+
+    // Check for deployment protection rules on any desired environments
+    const envsWithProtectionRules = resolvedEnvironments.filter(e => e.deployment_protection_rules !== undefined);
+
+    // Check for custom branch patterns to sync (treat omitted patterns as empty = delete all existing)
+    const branchPolicySubResults = [];
+    const envsWithBranchPatterns = [];
+    for (const e of resolvedEnvironments) {
+      if (e.deployment_branch_policy?.custom_branch_policies !== true) continue;
+      if (e.branch_name_patterns !== undefined && !Array.isArray(e.branch_name_patterns)) {
+        core.warning(
+          `  ⚠️  Invalid branch_name_patterns for environment "${e.name}": expected an array. Skipping branch policy sync.`
+        );
+        branchPolicySubResults.push(
+          createSubResult(
+            'environment-branch-policy',
+            SubResultStatus.WARNING,
+            `Invalid branch_name_patterns for environment "${e.name}"`
+          )
+        );
+        continue;
+      }
+      envsWithBranchPatterns.push({
+        ...e,
+        branch_name_patterns: Array.isArray(e.branch_name_patterns) ? e.branch_name_patterns : []
+      });
+    }
+
+    // If no environment changes, no protection rules, and no branch patterns to sync, return early
+    if (
+      environmentsToCreate.length === 0 &&
+      environmentsToUpdate.length === 0 &&
+      environmentsToDelete.length === 0 &&
+      envsWithProtectionRules.length === 0 &&
+      envsWithBranchPatterns.length === 0
+    ) {
+      return {
+        repository: repo,
+        success: true,
+        environments: 'unchanged',
+        message: `All ${environmentsUnchanged.length} environment(s) are already up to date`,
+        environmentsUnchanged: environmentsUnchanged.length,
+        dryRun
+      };
+    }
+
+    if (dryRun) {
+      const message = [];
+      if (environmentsToCreate.length > 0) {
+        message.push(`Would create ${environmentsToCreate.length} environment(s)`);
+      }
+      if (environmentsToUpdate.length > 0) {
+        message.push(`Would update ${environmentsToUpdate.length} environment(s)`);
+      }
+      if (environmentsToDelete.length > 0) {
+        message.push(`Would delete ${environmentsToDelete.length} environment(s)`);
+      }
+      if (message.length > 0) {
+        core.info(`  🌍 Dry run: ${message.join(', ')}`);
+      }
+    }
+
+    if (!dryRun) {
+      // Create new environments
+      for (const env of environmentsToCreate) {
+        await octokit.request(
+          'PUT /repos/{owner}/{repo}/environments/{environment_name}',
+          buildEnvironmentParams(owner, repoName, env)
+        );
+        core.info(`  🌍 Created environment: ${env.name}`);
+      }
+
+      // Update existing environments
+      for (const env of environmentsToUpdate) {
+        await octokit.request(
+          'PUT /repos/{owner}/{repo}/environments/{environment_name}',
+          buildEnvironmentParams(owner, repoName, env)
+        );
+        core.info(`  🌍 Updated environment: ${env.name}`);
+      }
+
+      // Delete unmanaged environments
+      for (const env of environmentsToDelete) {
+        await octokit.request('DELETE /repos/{owner}/{repo}/environments/{environment_name}', {
+          owner,
+          repo: repoName,
+          environment_name: env.name
+        });
+        core.info(`  🌍 Deleted environment: ${env.name}`);
+      }
+    }
+
+    // In dry-run, skip branch policy/protection rule sync for environments being created
+    // (they don't exist yet, so API calls would 404)
+    const envsToCreateNames = new Set(environmentsToCreate.map(e => e.name));
+
+    // Sync custom deployment branch policies for environments that use them
+    for (const env of envsWithBranchPatterns) {
+      if (dryRun && envsToCreateNames.has(env.name)) continue;
+      const policyResults = await syncDeploymentBranchPolicies(
+        octokit,
+        owner,
+        repoName,
+        env.name,
+        env.branch_name_patterns,
+        dryRun
+      );
+      branchPolicySubResults.push(...policyResults);
+    }
+
+    // Sync deployment protection rules for environments that define them
+    const protectionRuleSubResults = [];
+    for (const env of envsWithProtectionRules) {
+      if (dryRun && envsToCreateNames.has(env.name)) continue;
+      const ruleResults = await syncDeploymentProtectionRules(
+        octokit,
+        owner,
+        repoName,
+        env.name,
+        env.deployment_protection_rules ?? [],
+        dryRun
+      );
+      protectionRuleSubResults.push(...ruleResults);
+    }
+
+    const hasProtectionChanges = protectionRuleSubResults.some(s => s.status === SubResultStatus.CHANGED);
+    const hasProtectionWarnings = protectionRuleSubResults.some(s => s.status === SubResultStatus.WARNING);
+    const hasBranchPolicyChanges = branchPolicySubResults.some(s => s.status === SubResultStatus.CHANGED);
+    const hasBranchPolicyWarnings = branchPolicySubResults.some(s => s.status === SubResultStatus.WARNING);
+
+    // If nothing changed across environments, protection rules, or branch policies
+    if (
+      environmentsToCreate.length === 0 &&
+      environmentsToUpdate.length === 0 &&
+      environmentsToDelete.length === 0 &&
+      !hasProtectionChanges &&
+      !hasBranchPolicyChanges
+    ) {
+      return {
+        repository: repo,
+        success: true,
+        environments: 'unchanged',
+        message: `All ${resolvedEnvironments.length} environment(s) are already up to date`,
+        environmentsUnchanged: environmentsUnchanged.length,
+        protectionRuleSubResults,
+        branchPolicySubResults,
+        dryRun
+      };
+    }
+
+    const message = [];
+    if (environmentsToCreate.length > 0) {
+      message.push(`${dryRun ? 'Would create' : 'Created'} ${environmentsToCreate.length} environment(s)`);
+    }
+    if (environmentsToUpdate.length > 0) {
+      message.push(`${dryRun ? 'Would update' : 'Updated'} ${environmentsToUpdate.length} environment(s)`);
+    }
+    if (environmentsToDelete.length > 0) {
+      message.push(`${dryRun ? 'Would delete' : 'Deleted'} ${environmentsToDelete.length} environment(s)`);
+    }
+    if (hasProtectionChanges) {
+      message.push(`${dryRun ? 'Would update' : 'Updated'} deployment protection rules`);
+    }
+    if (hasProtectionWarnings) {
+      message.push(`Some deployment protection rule updates had warnings`);
+    }
+    if (hasBranchPolicyChanges) {
+      message.push(`${dryRun ? 'Would update' : 'Updated'} deployment branch policies`);
+    }
+    if (hasBranchPolicyWarnings) {
+      message.push(`Some deployment branch policy updates had warnings`);
+    }
+
+    return {
+      repository: repo,
+      success: true,
+      environments: dryRun ? 'would-update' : 'updated',
+      message: message.join(', '),
+      environmentsCreated: dryRun ? undefined : environmentsToCreate.map(e => e.name),
+      environmentsUpdated: dryRun ? undefined : environmentsToUpdate.map(e => e.name),
+      environmentsDeleted: dryRun ? undefined : environmentsToDelete.map(e => e.name),
+      environmentsWouldCreate: dryRun ? environmentsToCreate.map(e => e.name) : undefined,
+      environmentsWouldUpdate: dryRun ? environmentsToUpdate.map(e => e.name) : undefined,
+      environmentsWouldDelete: dryRun ? environmentsToDelete.map(e => e.name) : undefined,
+      environmentsUnchanged: environmentsUnchanged.length,
+      protectionRuleSubResults,
+      branchPolicySubResults,
+      dryRun
+    };
+  } catch (error) {
+    return {
+      repository: repo,
+      success: false,
+      error: `Failed to sync environments: ${error.message}`,
+      dryRun
+    };
+  }
+}
+
+/**
  * Sync copilot-instructions.md file to target repository
  * @param {Octokit} octokit - Octokit instance
  * @param {string} repo - Repository in "owner/repo" format
  * @param {string} copilotInstructionsPath - Path to local copilot-instructions.md file
  * @param {string} prTitle - Title for the pull request
  * @param {boolean} dryRun - Preview mode without making actual changes
+ * @param {string} [authenticatedLogin] - Login of the authenticated user/app for stale PR matching
  * @returns {Promise<Object>} Result object
  */
-export async function syncCopilotInstructions(octokit, repo, copilotInstructionsPath, prTitle, dryRun) {
+export async function syncCopilotInstructions(
+  octokit,
+  repo,
+  copilotInstructionsPath,
+  prTitle,
+  dryRun,
+  authenticatedLogin
+) {
   return syncFileViaPullRequest(
     octokit,
     repo,
@@ -2799,7 +4502,8 @@ export async function syncCopilotInstructions(octokit, repo, copilotInstructions
       prBodyCreate: `This PR adds \`.github/copilot-instructions.md\` to configure GitHub Copilot.\n\n**Changes:**\n- Added Copilot instructions`,
       prBodyUpdate: `This PR updates \`.github/copilot-instructions.md\` to the latest version.\n\n**Changes:**\n- Updated Copilot instructions`,
       resultKey: 'copilotInstructions',
-      fileDescription: 'copilot-instructions.md'
+      fileDescription: 'copilot-instructions.md',
+      authenticatedLogin
     },
     dryRun
   );
@@ -2813,10 +4517,20 @@ export async function syncCopilotInstructions(octokit, repo, copilotInstructions
  * @param {string} targetPath - Target path in the repository (.github/CODEOWNERS, CODEOWNERS, or docs/CODEOWNERS)
  * @param {string} prTitle - Title for the pull request
  * @param {boolean} dryRun - Preview mode without making actual changes
+ * @param {string} [authenticatedLogin] - Login of the authenticated user/app for stale PR matching
  * @param {Object} [templateVars] - Optional template variables for {{variable}} replacement
  * @returns {Promise<Object>} Result object
  */
-export async function syncCodeowners(octokit, repo, codeownersPath, targetPath, prTitle, dryRun, templateVars = null) {
+export async function syncCodeowners(
+  octokit,
+  repo,
+  codeownersPath,
+  targetPath,
+  prTitle,
+  dryRun,
+  authenticatedLogin,
+  templateVars = null
+) {
   // Validate target path
   const validPaths = ['.github/CODEOWNERS', 'CODEOWNERS', 'docs/CODEOWNERS'];
   if (!validPaths.includes(targetPath)) {
@@ -2849,6 +4563,7 @@ export async function syncCodeowners(octokit, repo, codeownersPath, targetPath, 
       prBodyUpdate: `This PR updates \`${targetPath}\` to the latest version.\n\n**Changes:**\n- Updated CODEOWNERS file`,
       resultKey: 'codeowners',
       fileDescription: 'CODEOWNERS',
+      authenticatedLogin,
       contentTransformer
     },
     dryRun
@@ -2856,315 +4571,31 @@ export async function syncCodeowners(octokit, repo, codeownersPath, targetPath, 
 }
 
 /**
- * Get a list of specific changes made to a repository
+ * Check if a repository result has any changes
  * @param {Object} result - Repository update result object
- * @param {boolean} dryRun - Whether this is a dry-run
- * @returns {Array<string>} List of change descriptions
+ * @returns {boolean} True if there are any changes
  */
-function getChangesList(result, dryRun) {
-  const changes = [];
-  const wouldPrefix = dryRun ? 'Would update ' : '';
-
-  /**
-   * Format a PR reference as a markdown link if URL is available
-   * @param {number} prNumber - PR number
-   * @param {string} prUrl - PR URL
-   * @returns {string} Formatted PR reference (linked or plain)
-   */
-  const formatPrRef = (prNumber, prUrl) => (prUrl ? `[PR #${prNumber}](${prUrl})` : `PR #${prNumber}`);
-
-  // Repository settings changes
-  if (result.changes && result.changes.length > 0) {
-    const settingNames = result.changes.map(c => c.setting.replace(/_/g, '-'));
-    changes.push(`${wouldPrefix}settings: ${settingNames.join(', ')}`);
+function hasRepositoryChanges(result) {
+  if (result.subResults && result.subResults.length > 0) {
+    return result.subResults.some(s => s.status === SubResultStatus.CHANGED);
   }
-
-  // Topics changes
-  if (result.topicsChange) {
-    const topicChanges = [];
-    if (result.topicsChange.added.length > 0) {
-      topicChanges.push(`+${result.topicsChange.added.join(', ')}`);
-    }
-    if (result.topicsChange.removed.length > 0) {
-      topicChanges.push(`-${result.topicsChange.removed.join(', ')}`);
-    }
-    changes.push(`${wouldPrefix}topics: ${topicChanges.join(', ')}`);
-  }
-
-  // Code scanning changes
-  if (result.codeScanningChange) {
-    changes.push(`${wouldPrefix}CodeQL scanning`);
-  }
-
-  // Immutable releases changes
-  if (result.immutableReleasesChange) {
-    const action = result.immutableReleasesChange.to ? 'enable' : 'disable';
-    const actionText = dryRun ? `Would ${action}` : `${action.charAt(0).toUpperCase()}${action.slice(1)}d`;
-    changes.push(`${actionText} immutable releases`);
-  }
-
-  // Secret scanning changes
-  if (result.secretScanningChange) {
-    const action = result.secretScanningChange.to ? 'enable' : 'disable';
-    const actionText = dryRun ? `Would ${action}` : `${action.charAt(0).toUpperCase()}${action.slice(1)}d`;
-    changes.push(`${actionText} secret scanning`);
-  }
-
-  // Secret scanning push protection changes
-  if (result.secretScanningPushProtectionChange) {
-    const action = result.secretScanningPushProtectionChange.to ? 'enable' : 'disable';
-    const actionText = dryRun ? `Would ${action}` : `${action.charAt(0).toUpperCase()}${action.slice(1)}d`;
-    changes.push(`${actionText} secret scanning push protection`);
-  }
-
-  // Dependabot alerts changes
-  if (result.dependabotAlertsChange) {
-    const action = result.dependabotAlertsChange.to ? 'enable' : 'disable';
-    const actionText = dryRun ? `Would ${action}` : `${action.charAt(0).toUpperCase()}${action.slice(1)}d`;
-    changes.push(`${actionText} Dependabot alerts`);
-  }
-
-  // Dependabot security updates changes
-  if (result.dependabotSecurityUpdatesChange) {
-    const action = result.dependabotSecurityUpdatesChange.to ? 'enable' : 'disable';
-    const actionText = dryRun ? `Would ${action}` : `${action.charAt(0).toUpperCase()}${action.slice(1)}d`;
-    changes.push(`${actionText} Dependabot security updates`);
-  }
-
-  // Dependabot changes
-  if (
-    result.dependabotSync?.success &&
-    result.dependabotSync.dependabotYml &&
-    result.dependabotSync.dependabotYml !== 'unchanged'
-  ) {
-    const status = result.dependabotSync.dependabotYml;
-    if (status === 'pr-up-to-date') {
-      changes.push(
-        `dependabot.yml ${formatPrRef(result.dependabotSync.prNumber, result.dependabotSync.prUrl)} up-to-date (pending merge)`
-      );
-    } else if (status === 'pr-exists') {
-      changes.push(
-        `dependabot.yml PR exists (${formatPrRef(result.dependabotSync.prNumber, result.dependabotSync.prUrl)})`
-      );
-    } else if (status.startsWith('would-')) {
-      changes.push(`Would sync dependabot.yml`);
-    } else {
-      changes.push(
-        `${wouldPrefix}dependabot.yml (${formatPrRef(result.dependabotSync.prNumber, result.dependabotSync.prUrl)})`
-      );
-    }
-  }
-
-  // Gitignore changes
-  if (
-    result.gitignoreSync?.success &&
-    result.gitignoreSync.gitignore &&
-    result.gitignoreSync.gitignore !== 'unchanged'
-  ) {
-    const status = result.gitignoreSync.gitignore;
-    if (status === 'pr-up-to-date') {
-      changes.push(
-        `.gitignore ${formatPrRef(result.gitignoreSync.prNumber, result.gitignoreSync.prUrl)} up-to-date (pending merge)`
-      );
-    } else if (status === 'pr-exists') {
-      changes.push(`.gitignore PR exists (${formatPrRef(result.gitignoreSync.prNumber, result.gitignoreSync.prUrl)})`);
-    } else if (status.startsWith('would-')) {
-      changes.push(`Would sync .gitignore`);
-    } else {
-      changes.push(
-        `${wouldPrefix}.gitignore (${formatPrRef(result.gitignoreSync.prNumber, result.gitignoreSync.prUrl)})`
-      );
-    }
-  }
-
-  // Ruleset changes
-  if (result.rulesetSync?.success && result.rulesetSync.ruleset && result.rulesetSync.ruleset !== 'unchanged') {
-    const status = result.rulesetSync.ruleset;
-    if (status === 'pr-up-to-date') {
-      // Rulesets don't use PRs, so this shouldn't happen, but handle it gracefully
-      changes.push(`ruleset up-to-date`);
-    } else if (status.startsWith('would-')) {
-      changes.push(`Would sync ruleset`);
-    } else {
-      changes.push(`${wouldPrefix}ruleset`);
-    }
-  }
-
-  // Pull request template changes
-  if (
-    result.pullRequestTemplateSync?.success &&
-    result.pullRequestTemplateSync.pullRequestTemplate &&
-    result.pullRequestTemplateSync.pullRequestTemplate !== 'unchanged'
-  ) {
-    const status = result.pullRequestTemplateSync.pullRequestTemplate;
-    if (status === 'pr-up-to-date') {
-      changes.push(
-        `PR template ${formatPrRef(result.pullRequestTemplateSync.prNumber, result.pullRequestTemplateSync.prUrl)} up-to-date (pending merge)`
-      );
-    } else if (status === 'pr-exists') {
-      changes.push(
-        `PR template PR exists (${formatPrRef(result.pullRequestTemplateSync.prNumber, result.pullRequestTemplateSync.prUrl)})`
-      );
-    } else if (status.startsWith('would-')) {
-      changes.push(`Would sync PR template`);
-    } else {
-      changes.push(
-        `${wouldPrefix}PR template (${formatPrRef(result.pullRequestTemplateSync.prNumber, result.pullRequestTemplateSync.prUrl)})`
-      );
-    }
-  }
-
-  // Workflow files changes
-  if (
-    result.workflowFilesSync?.success &&
-    result.workflowFilesSync.workflowFiles &&
-    result.workflowFilesSync.workflowFiles !== 'unchanged'
-  ) {
-    const status = result.workflowFilesSync.workflowFiles;
-    if (status === 'pr-up-to-date') {
-      changes.push(
-        `workflow files ${formatPrRef(result.workflowFilesSync.prNumber, result.workflowFilesSync.prUrl)} up-to-date (pending merge)`
-      );
-    } else if (status === 'pr-exists') {
-      changes.push(
-        `workflow files PR exists (${formatPrRef(result.workflowFilesSync.prNumber, result.workflowFilesSync.prUrl)})`
-      );
-    } else if (status.startsWith('would-')) {
-      changes.push(`Would sync workflow files`);
-    } else {
-      changes.push(
-        `${wouldPrefix}workflow files (${formatPrRef(result.workflowFilesSync.prNumber, result.workflowFilesSync.prUrl)})`
-      );
-    }
-  }
-
-  // Autolinks changes
-  if (
-    result.autolinksSync?.success &&
-    result.autolinksSync.autolinks &&
-    result.autolinksSync.autolinks !== 'unchanged'
-  ) {
-    const status = result.autolinksSync.autolinks;
-    if (status === 'pr-up-to-date') {
-      // Autolinks don't use PRs, so this shouldn't happen, but handle it gracefully
-      changes.push(`autolinks up-to-date`);
-    } else if (status.startsWith('would-')) {
-      changes.push(`Would sync autolinks`);
-    } else {
-      changes.push(`${wouldPrefix}autolinks`);
-    }
-  }
-
-  // Copilot instructions changes
-  if (
-    result.copilotInstructionsSync?.success &&
-    result.copilotInstructionsSync.copilotInstructions &&
-    result.copilotInstructionsSync.copilotInstructions !== 'unchanged'
-  ) {
-    const status = result.copilotInstructionsSync.copilotInstructions;
-    if (status === 'pr-up-to-date') {
-      changes.push(
-        `copilot-instructions.md ${formatPrRef(result.copilotInstructionsSync.prNumber, result.copilotInstructionsSync.prUrl)} up-to-date (pending merge)`
-      );
-    } else if (status === 'pr-exists') {
-      changes.push(
-        `copilot-instructions.md PR exists (${formatPrRef(result.copilotInstructionsSync.prNumber, result.copilotInstructionsSync.prUrl)})`
-      );
-    } else if (status.startsWith('would-')) {
-      changes.push(`Would sync copilot-instructions.md`);
-    } else {
-      changes.push(
-        `${wouldPrefix}copilot-instructions.md (${formatPrRef(result.copilotInstructionsSync.prNumber, result.copilotInstructionsSync.prUrl)})`
-      );
-    }
-  }
-
-  // Package.json changes
-  if (
-    result.packageJsonSync?.success &&
-    result.packageJsonSync.packageJson &&
-    result.packageJsonSync.packageJson !== 'unchanged'
-  ) {
-    const status = result.packageJsonSync.packageJson;
-    if (status === 'pr-up-to-date') {
-      changes.push(
-        `package.json ${formatPrRef(result.packageJsonSync.prNumber, result.packageJsonSync.prUrl)} up-to-date (pending merge)`
-      );
-    } else if (status === 'pr-exists') {
-      changes.push(
-        `package.json PR exists (${formatPrRef(result.packageJsonSync.prNumber, result.packageJsonSync.prUrl)})`
-      );
-    } else if (status.startsWith('would-')) {
-      changes.push(`Would sync package.json`);
-    } else {
-      changes.push(
-        `${wouldPrefix}package.json (${formatPrRef(result.packageJsonSync.prNumber, result.packageJsonSync.prUrl)})`
-      );
-    }
-  }
-
-  // CODEOWNERS changes
-  if (
-    result.codeownersSync?.success &&
-    result.codeownersSync.codeowners &&
-    result.codeownersSync.codeowners !== 'unchanged'
-  ) {
-    const status = result.codeownersSync.codeowners;
-    if (status === 'pr-up-to-date') {
-      changes.push(
-        `CODEOWNERS ${formatPrRef(result.codeownersSync.prNumber, result.codeownersSync.prUrl)} up-to-date (pending merge)`
-      );
-    } else if (status === 'pr-exists') {
-      changes.push(
-        `CODEOWNERS PR exists (${formatPrRef(result.codeownersSync.prNumber, result.codeownersSync.prUrl)})`
-      );
-    } else if (status.startsWith('would-')) {
-      changes.push(`Would sync CODEOWNERS`);
-    } else {
-      changes.push(
-        `${wouldPrefix}CODEOWNERS (${formatPrRef(result.codeownersSync.prNumber, result.codeownersSync.prUrl)})`
-      );
-    }
-  }
-
-  return changes;
+  return false;
 }
 
 /**
- * Check if a repository result has any changes
+ * Check if a repository result is pending — has at least one PENDING sub-result
+ * (an open sync PR already up-to-date, just needing merge) and no real CHANGED
+ * sub-results from this run. A repo with both CHANGED and PENDING sub-results
+ * is classified as changed, not pending.
  * @param {Object} result - Repository update result object
- * @returns {boolean} True if there are any changes (settings, topics, code scanning, immutable releases, dependabot, gitignore, rulesets, pull request template, workflow files, autolinks, copilot instructions, package.json, or codeowners)
+ * @returns {boolean} True if pending and not changed
  */
-function hasRepositoryChanges(result) {
-  // Helper to check if a sync status represents something to report
-  // 'unchanged' means nothing to show, but 'pr-up-to-date' means there's a pending PR to display
-  const hasSyncChanges = status => status && status !== 'unchanged';
-
-  return (
-    (result.changes && result.changes.length > 0) ||
-    result.topicsChange ||
-    result.codeScanningChange ||
-    result.immutableReleasesChange ||
-    result.secretScanningChange ||
-    result.secretScanningPushProtectionChange ||
-    result.dependabotAlertsChange ||
-    result.dependabotSecurityUpdatesChange ||
-    (result.dependabotSync && result.dependabotSync.success && hasSyncChanges(result.dependabotSync.dependabotYml)) ||
-    (result.gitignoreSync && result.gitignoreSync.success && hasSyncChanges(result.gitignoreSync.gitignore)) ||
-    (result.rulesetSync && result.rulesetSync.success && hasSyncChanges(result.rulesetSync.ruleset)) ||
-    (result.pullRequestTemplateSync &&
-      result.pullRequestTemplateSync.success &&
-      hasSyncChanges(result.pullRequestTemplateSync.pullRequestTemplate)) ||
-    (result.workflowFilesSync &&
-      result.workflowFilesSync.success &&
-      hasSyncChanges(result.workflowFilesSync.workflowFiles)) ||
-    (result.autolinksSync && result.autolinksSync.success && hasSyncChanges(result.autolinksSync.autolinks)) ||
-    (result.copilotInstructionsSync &&
-      result.copilotInstructionsSync.success &&
-      hasSyncChanges(result.copilotInstructionsSync.copilotInstructions)) ||
-    (result.packageJsonSync && result.packageJsonSync.success && hasSyncChanges(result.packageJsonSync.packageJson)) ||
-    (result.codeownersSync && result.codeownersSync.success && hasSyncChanges(result.codeownersSync.codeowners))
-  );
+function hasRepositoryPending(result) {
+  if (!result.subResults || result.subResults.length === 0) return false;
+  const hasPending = result.subResults.some(s => s.status === SubResultStatus.PENDING);
+  if (!hasPending) return false;
+  const hasChanged = result.subResults.some(s => s.status === SubResultStatus.CHANGED);
+  return !hasChanged;
 }
 
 /**
@@ -3173,18 +4604,22 @@ function hasRepositoryChanges(result) {
 export async function run() {
   try {
     // Get inputs
-    const githubToken = getInput('github-token');
-    const githubApiUrl = getInput('github-api-url') || 'https://api.github.com';
-    const repositories = getInput('repositories');
-    const repositoriesFile = getInput('repositories-file');
-    const owner = getInput('owner');
-    const customPropertyName = getInput('custom-property-name');
-    const customPropertyValue = getInput('custom-property-value');
+    const githubToken = core.getInput('github-token');
+    const githubApiUrl = core.getInput('github-api-url') || 'https://api.github.com';
+    const repositories = core.getInput('repositories');
+    const repositoriesFile = core.getInput('repositories-file');
+    const owner = core.getInput('owner');
+    const customPropertyName = core.getInput('custom-property-name');
+    const customPropertyValue = core.getInput('custom-property-value');
 
     // Get settings inputs
     const settings = {
       allow_squash_merge: getBooleanInput('allow-squash-merge'),
+      squash_merge_commit_title: getEnumInput('squash-merge-commit-title', ['PR_TITLE', 'COMMIT_OR_PR_TITLE']),
+      squash_merge_commit_message: getEnumInput('squash-merge-commit-message', ['PR_BODY', 'COMMIT_MESSAGES', 'BLANK']),
       allow_merge_commit: getBooleanInput('allow-merge-commit'),
+      merge_commit_title: getEnumInput('merge-commit-title', ['PR_TITLE', 'MERGE_MESSAGE']),
+      merge_commit_message: getEnumInput('merge-commit-message', ['PR_TITLE', 'PR_BODY', 'BLANK']),
       allow_rebase_merge: getBooleanInput('allow-rebase-merge'),
       allow_auto_merge: getBooleanInput('allow-auto-merge'),
       delete_branch_on_merge: getBooleanInput('delete-branch-on-merge'),
@@ -3207,14 +4642,17 @@ export async function run() {
     const securitySettings = {
       secretScanning: getBooleanInput('secret-scanning'),
       secretScanningPushProtection: getBooleanInput('secret-scanning-push-protection'),
+      privateVulnerabilityReporting: getBooleanInput('private-vulnerability-reporting'),
       dependabotAlerts: getBooleanInput('dependabot-alerts'),
       dependabotSecurityUpdates: getBooleanInput('dependabot-security-updates')
     };
 
     const dryRun = getBooleanInput('dry-run');
+    const writeJobSummary = getBooleanInput('write-job-summary') !== false;
+    const jobSummaryHeadingBase = core.getInput('summary-heading').trim();
 
     // Parse topics if provided
-    const topicsInput = getInput('topics');
+    const topicsInput = core.getInput('topics');
     const topics = topicsInput
       ? topicsInput
           .split(',')
@@ -3223,50 +4661,64 @@ export async function run() {
       : null;
 
     // Get dependabot.yml settings
-    const dependabotYml = getInput('dependabot-yml');
-    const dependabotPrTitle = getInput('dependabot-pr-title') || 'chore: update dependabot.yml';
+    const dependabotYml = core.getInput('dependabot-yml');
+    const dependabotPrTitle = core.getInput('dependabot-pr-title') || 'chore: update dependabot.yml';
 
     // Get .gitignore settings
-    const gitignore = getInput('gitignore');
-    const gitignorePrTitle = getInput('gitignore-pr-title') || 'chore: update .gitignore';
+    const gitignore = core.getInput('gitignore');
+    const gitignorePrTitle = core.getInput('gitignore-pr-title') || 'chore: update .gitignore';
 
     // Get rulesets settings
-    const rulesetsFile = getInput('rulesets-file');
+    const rulesetsFileInput = core.getInput('rulesets-file');
+    const rulesetsFiles = rulesetsFileInput ? parseRulesetsFileValue(rulesetsFileInput) : [];
     const deleteUnmanagedRulesets = getBooleanInput('delete-unmanaged-rulesets');
 
     // Get pull request template settings
-    const pullRequestTemplate = getInput('pull-request-template');
+    const pullRequestTemplate = core.getInput('pull-request-template');
     const pullRequestTemplatePrTitle =
-      getInput('pull-request-template-pr-title') || 'chore: update pull request template';
+      core.getInput('pull-request-template-pr-title') || 'chore: update pull request template';
 
     // Get workflow files settings
-    const workflowFilesInput = getInput('workflow-files');
+    const workflowFilesInput = core.getInput('workflow-files');
     const workflowFiles = workflowFilesInput
       ? workflowFilesInput
           .split(',')
           .map(f => f.trim())
           .filter(f => f.length > 0)
       : null;
-    const workflowFilesPrTitle = getInput('workflow-files-pr-title') || 'chore: sync workflow configuration';
+    const workflowFilesPrTitle = core.getInput('workflow-files-pr-title') || 'chore: sync workflow configuration';
 
     // Get autolinks settings
-    const autolinksFile = getInput('autolinks-file');
+    const autolinksFile = core.getInput('autolinks-file');
+
+    // Get environments settings
+    const environmentNames = core.getInput('environments');
+    const environmentsFile = core.getInput('environments-file');
+    const deleteUnmanagedEnvironments = getBooleanInput('delete-unmanaged-environments');
+    let globalEnvironments = [];
+    if (environmentNames || environmentsFile) {
+      try {
+        globalEnvironments = parseEnvironmentsConfig(environmentNames, environmentsFile);
+      } catch (error) {
+        throw new Error(`Failed to parse environments config: ${error.message}`);
+      }
+    }
 
     // Get copilot instructions settings
-    const copilotInstructionsMd = getInput('copilot-instructions-md');
+    const copilotInstructionsMd = core.getInput('copilot-instructions-md');
     const copilotInstructionsPrTitle =
-      getInput('copilot-instructions-pr-title') || 'chore: update copilot-instructions.md';
+      core.getInput('copilot-instructions-pr-title') || 'chore: update copilot-instructions.md';
 
     // Get CODEOWNERS settings
-    const codeowners = getInput('codeowners');
-    const codeownersTargetPath = getInput('codeowners-target-path') || '.github/CODEOWNERS';
-    const codeownersPrTitle = getInput('codeowners-pr-title') || 'chore: update CODEOWNERS';
+    const codeowners = core.getInput('codeowners');
+    const codeownersTargetPath = core.getInput('codeowners-target-path') || '.github/CODEOWNERS';
+    const codeownersPrTitle = core.getInput('codeowners-pr-title') || 'chore: update CODEOWNERS';
 
     // Get package.json sync settings
-    const packageJsonFile = getInput('package-json-file');
+    const packageJsonFile = core.getInput('package-json-file');
     const syncScripts = getBooleanInput('package-json-sync-scripts');
     const syncEngines = getBooleanInput('package-json-sync-engines');
-    const packageJsonPrTitle = getInput('package-json-pr-title') || 'chore: update package.json';
+    const packageJsonPrTitle = core.getInput('package-json-pr-title') || 'chore: update package.json';
 
     core.info('Starting Bulk GitHub Repository Settings Action...');
 
@@ -3280,26 +4732,27 @@ export async function run() {
 
     // Check if any settings are specified
     // Skip this check if repositoriesFile is provided (rules-based configs define settings in file)
-    const hasSecuritySettings = Object.values(securitySettings).some(value => value !== null);
+    const hasSecuritySettings = Object.values(securitySettings).some(value => value != null);
     const hasSettings =
       repositoriesFile ||
-      Object.values(settings).some(value => value !== null) ||
-      enableCodeScanning !== null ||
-      immutableReleases !== null ||
+      Object.values(settings).some(value => value != null) ||
+      enableCodeScanning != null ||
+      immutableReleases != null ||
       hasSecuritySettings ||
-      topics !== null ||
+      topics != null ||
       dependabotYml ||
       gitignore ||
-      rulesetsFile ||
+      rulesetsFiles.length > 0 ||
       pullRequestTemplate ||
       (workflowFiles && workflowFiles.length > 0) ||
       autolinksFile ||
+      globalEnvironments.length > 0 ||
       copilotInstructionsMd ||
       codeowners ||
       (packageJsonFile && (syncScripts || syncEngines));
     if (!hasSettings) {
       throw new Error(
-        'At least one repository setting must be specified (or code-scanning must be true, or immutable-releases must be specified, or security settings must be specified, or topics must be provided, or dependabot-yml must be specified, or gitignore must be specified, or rulesets-file must be specified, or pull-request-template must be specified, or workflow-files must be specified, or autolinks-file must be specified, or copilot-instructions-md must be specified, or codeowners must be specified, or package-json-file with package-json-sync-scripts or package-json-sync-engines must be specified)'
+        'At least one repository setting must be specified (or code-scanning must be true, or immutable-releases must be specified, or security settings must be specified, or topics must be provided, or dependabot-yml must be specified, or gitignore must be specified, or rulesets-file must be specified, or pull-request-template must be specified, or workflow-files must be specified, or autolinks-file must be specified, or environments must be specified, or copilot-instructions-md must be specified, or codeowners must be specified, or package-json-file with package-json-sync-scripts or package-json-sync-engines must be specified)'
       );
     }
 
@@ -3308,6 +4761,16 @@ export async function run() {
       auth: githubToken,
       baseUrl: githubApiUrl
     });
+
+    // Get authenticated user/app login for stale PR author matching
+    let authenticatedLogin = '';
+    try {
+      const { viewer } = await octokit.graphql('{ viewer { login } }');
+      authenticatedLogin = viewer.login;
+      core.debug(`Authenticated as: ${authenticatedLogin}`);
+    } catch (error) {
+      core.debug(`Could not determine authenticated user: ${error.message}`);
+    }
 
     // Parse repository list
     const repoList = await parseRepositories(
@@ -3336,8 +4799,8 @@ export async function run() {
     if (gitignore) {
       core.info(`.gitignore will be synced from: ${gitignore}`);
     }
-    if (rulesetsFile) {
-      core.info(`Repository ruleset will be synced from: ${rulesetsFile}`);
+    if (rulesetsFiles.length > 0) {
+      core.info(`Repository rulesets will be synced from: ${rulesetsFiles.join(', ')}`);
     }
     if (pullRequestTemplate) {
       core.info(`Pull request template will be synced from: ${pullRequestTemplate}`);
@@ -3347,6 +4810,9 @@ export async function run() {
     }
     if (autolinksFile) {
       core.info(`Autolinks will be synced from: ${autolinksFile}`);
+    }
+    if (globalEnvironments.length > 0) {
+      core.info(`Environments will be synced: ${globalEnvironments.map(e => e.name).join(', ')}`);
     }
     if (copilotInstructionsMd) {
       core.info(`Copilot-instructions.md will be synced from: ${copilotInstructionsMd}`);
@@ -3360,6 +4826,11 @@ export async function run() {
     if (securitySettings.secretScanningPushProtection !== null) {
       core.info(
         `Secret scanning push protection will be ${securitySettings.secretScanningPushProtection ? 'enabled' : 'disabled'}`
+      );
+    }
+    if (securitySettings.privateVulnerabilityReporting !== null) {
+      core.info(
+        `Private vulnerability reporting will be ${securitySettings.privateVulnerabilityReporting ? 'enabled' : 'disabled'}`
       );
     }
     if (securitySettings.dependabotAlerts !== null) {
@@ -3376,6 +4847,11 @@ export async function run() {
     let successCount = 0;
     let failureCount = 0;
     let changedCount = 0;
+    let pendingCount = 0;
+    let warningCount = 0;
+
+    // Cache for resolved reviewer IDs across repos (avoids duplicate API calls)
+    const reviewerCache = new Map();
 
     for (const repoConfig of repoList) {
       const repo = repoConfig.repo;
@@ -3383,149 +4859,247 @@ export async function run() {
 
       // Merge global settings with repo-specific overrides
       const repoSettings = {
-        allow_squash_merge:
-          repoConfig['allow-squash-merge'] !== undefined
-            ? repoConfig['allow-squash-merge']
-            : settings.allow_squash_merge,
-        allow_merge_commit:
-          repoConfig['allow-merge-commit'] !== undefined
-            ? repoConfig['allow-merge-commit']
-            : settings.allow_merge_commit,
-        allow_rebase_merge:
-          repoConfig['allow-rebase-merge'] !== undefined
-            ? repoConfig['allow-rebase-merge']
-            : settings.allow_rebase_merge,
-        allow_auto_merge:
-          repoConfig['allow-auto-merge'] !== undefined ? repoConfig['allow-auto-merge'] : settings.allow_auto_merge,
-        delete_branch_on_merge:
-          repoConfig['delete-branch-on-merge'] !== undefined
-            ? repoConfig['delete-branch-on-merge']
-            : settings.delete_branch_on_merge,
-        allow_update_branch:
-          repoConfig['allow-update-branch'] !== undefined
-            ? repoConfig['allow-update-branch']
-            : settings.allow_update_branch
+        allow_squash_merge: coerceBooleanConfig(
+          repoConfig['allow-squash-merge'],
+          'allow-squash-merge',
+          repo,
+          settings.allow_squash_merge
+        ),
+        squash_merge_commit_title: coerceEnumConfig(
+          repoConfig['squash-merge-commit-title'],
+          'squash-merge-commit-title',
+          repo,
+          ['PR_TITLE', 'COMMIT_OR_PR_TITLE'],
+          settings.squash_merge_commit_title
+        ),
+        squash_merge_commit_message: coerceEnumConfig(
+          repoConfig['squash-merge-commit-message'],
+          'squash-merge-commit-message',
+          repo,
+          ['PR_BODY', 'COMMIT_MESSAGES', 'BLANK'],
+          settings.squash_merge_commit_message
+        ),
+        allow_merge_commit: coerceBooleanConfig(
+          repoConfig['allow-merge-commit'],
+          'allow-merge-commit',
+          repo,
+          settings.allow_merge_commit
+        ),
+        merge_commit_title: coerceEnumConfig(
+          repoConfig['merge-commit-title'],
+          'merge-commit-title',
+          repo,
+          ['PR_TITLE', 'MERGE_MESSAGE'],
+          settings.merge_commit_title
+        ),
+        merge_commit_message: coerceEnumConfig(
+          repoConfig['merge-commit-message'],
+          'merge-commit-message',
+          repo,
+          ['PR_TITLE', 'PR_BODY', 'BLANK'],
+          settings.merge_commit_message
+        ),
+        allow_rebase_merge: coerceBooleanConfig(
+          repoConfig['allow-rebase-merge'],
+          'allow-rebase-merge',
+          repo,
+          settings.allow_rebase_merge
+        ),
+        allow_auto_merge: coerceBooleanConfig(
+          repoConfig['allow-auto-merge'],
+          'allow-auto-merge',
+          repo,
+          settings.allow_auto_merge
+        ),
+        delete_branch_on_merge: coerceBooleanConfig(
+          repoConfig['delete-branch-on-merge'],
+          'delete-branch-on-merge',
+          repo,
+          settings.delete_branch_on_merge
+        ),
+        allow_update_branch: coerceBooleanConfig(
+          repoConfig['allow-update-branch'],
+          'allow-update-branch',
+          repo,
+          settings.allow_update_branch
+        )
       };
 
       // Handle repo-specific code scanning (support both new and deprecated input names)
-      let repoEnableCodeScanning = enableCodeScanning;
-      if (repoConfig['code-scanning'] !== undefined) {
-        repoEnableCodeScanning = repoConfig['code-scanning'];
-      } else if (repoConfig['enable-default-code-scanning'] !== undefined) {
-        repoEnableCodeScanning = repoConfig['enable-default-code-scanning'];
-      }
+      const repoEnableCodeScanning =
+        repoConfig['code-scanning'] !== undefined
+          ? coerceBooleanConfig(repoConfig['code-scanning'], 'code-scanning', repo, enableCodeScanning)
+          : repoConfig['enable-default-code-scanning'] !== undefined
+            ? coerceBooleanConfig(
+                repoConfig['enable-default-code-scanning'],
+                'enable-default-code-scanning',
+                repo,
+                enableCodeScanning
+              )
+            : enableCodeScanning;
 
       // Handle repo-specific immutable releases
-      const repoImmutableReleases =
-        repoConfig['immutable-releases'] !== undefined ? repoConfig['immutable-releases'] : immutableReleases;
+      const repoImmutableReleases = coerceBooleanConfig(
+        repoConfig['immutable-releases'],
+        'immutable-releases',
+        repo,
+        immutableReleases
+      );
 
       // Handle repo-specific topics
-      let repoTopics = topics;
-      if (repoConfig.topics !== undefined) {
+      const repoTopics = (() => {
+        if (repoConfig.topics === undefined) return topics;
         if (typeof repoConfig.topics === 'string') {
-          repoTopics = repoConfig.topics
+          return repoConfig.topics
             .split(',')
             .map(t => t.trim())
             .filter(t => t.length > 0);
-        } else if (Array.isArray(repoConfig.topics)) {
-          repoTopics = repoConfig.topics;
-        } else {
-          repoTopics = null;
         }
-      }
+        if (Array.isArray(repoConfig.topics)) return repoConfig.topics;
+        return null;
+      })();
 
       // Handle repo-specific dependabot.yml
-      let repoDependabotYml = dependabotYml;
-      if (repoConfig['dependabot-yml'] !== undefined) {
-        repoDependabotYml = repoConfig['dependabot-yml'];
-      }
+      const repoDependabotYml =
+        repoConfig['dependabot-yml'] !== undefined ? repoConfig['dependabot-yml'] : dependabotYml;
 
       // Handle repo-specific .gitignore
-      let repoGitignore = gitignore;
-      if (repoConfig['gitignore'] !== undefined) {
-        repoGitignore = repoConfig['gitignore'];
-      }
+      const repoGitignore = repoConfig['gitignore'] !== undefined ? repoConfig['gitignore'] : gitignore;
 
-      // Handle repo-specific rulesets-file
-      let repoRulesetsFile = rulesetsFile;
-      if (repoConfig['rulesets-file'] !== undefined) {
-        repoRulesetsFile = repoConfig['rulesets-file'];
-      }
+      // Handle repo-specific rulesets-file (supports comma-separated string or YAML array)
+      const repoRulesetsFiles = (() => {
+        if (repoConfig['rulesets-file'] === undefined) return rulesetsFiles;
+        return parseRulesetsFileValue(repoConfig['rulesets-file'], repo);
+      })();
+      const repoDeleteUnmanagedRulesets = coerceBooleanConfig(
+        repoConfig['delete-unmanaged-rulesets'],
+        'delete-unmanaged-rulesets',
+        repo,
+        deleteUnmanagedRulesets
+      );
 
       // Handle repo-specific pull-request-template
-      let repoPullRequestTemplate = pullRequestTemplate;
-      if (repoConfig['pull-request-template'] !== undefined) {
-        repoPullRequestTemplate = repoConfig['pull-request-template'];
-      }
+      const repoPullRequestTemplate =
+        repoConfig['pull-request-template'] !== undefined ? repoConfig['pull-request-template'] : pullRequestTemplate;
 
       // Handle repo-specific workflow-files
-      let repoWorkflowFiles = workflowFiles;
-      if (repoConfig['workflow-files'] !== undefined) {
+      const repoWorkflowFiles = (() => {
+        if (repoConfig['workflow-files'] === undefined) return workflowFiles;
         if (typeof repoConfig['workflow-files'] === 'string') {
-          repoWorkflowFiles = repoConfig['workflow-files']
+          return repoConfig['workflow-files']
             .split(',')
             .map(f => f.trim())
             .filter(f => f.length > 0);
-        } else if (Array.isArray(repoConfig['workflow-files'])) {
-          repoWorkflowFiles = repoConfig['workflow-files'];
-        } else {
-          repoWorkflowFiles = null;
         }
-      }
+        if (Array.isArray(repoConfig['workflow-files'])) return repoConfig['workflow-files'];
+        return null;
+      })();
 
       // Handle repo-specific autolinks-file
-      let repoAutolinksFile = autolinksFile;
-      if (repoConfig['autolinks-file'] !== undefined) {
-        repoAutolinksFile = repoConfig['autolinks-file'];
+      const repoAutolinksFile =
+        repoConfig['autolinks-file'] !== undefined ? repoConfig['autolinks-file'] : autolinksFile;
+
+      // Handle repo-specific environments
+      let repoEnvironments = globalEnvironments;
+      let repoHasExplicitEnvConfig = globalEnvironments.length > 0;
+      if (repoConfig['environments'] !== undefined || repoConfig['environments-file'] !== undefined) {
+        repoHasExplicitEnvConfig = true;
+        try {
+          const rawEnv = repoConfig['environments'];
+          let repoEnvNames = null;
+          if (rawEnv !== undefined && rawEnv !== null) {
+            if (typeof rawEnv === 'string') {
+              repoEnvNames = rawEnv;
+            } else if (Array.isArray(rawEnv)) {
+              repoEnvNames = rawEnv
+                .map(n => {
+                  if (typeof n !== 'string') {
+                    throw new Error('Repo-specific environments array must contain only string environment names');
+                  }
+                  return n.trim();
+                })
+                .filter(n => n.length > 0)
+                .join(',');
+            } else {
+              throw new Error('Repo-specific environments must be a string, an array of strings, or null');
+            }
+          }
+          const repoEnvFile = repoConfig['environments-file'] !== undefined ? repoConfig['environments-file'] : null;
+          repoEnvironments = parseEnvironmentsConfig(repoEnvNames, repoEnvFile);
+        } catch (error) {
+          core.warning(
+            `Failed to parse environments config for ${repo}: ${error.message}. Skipping environment sync for this repo.`
+          );
+          repoEnvironments = null;
+        }
       }
+      const repoDeleteUnmanagedEnvironments = coerceBooleanConfig(
+        repoConfig['delete-unmanaged-environments'],
+        'delete-unmanaged-environments',
+        repo,
+        deleteUnmanagedEnvironments
+      );
 
       // Handle repo-specific copilot-instructions-md
-      let repoCopilotInstructionsMd = copilotInstructionsMd;
-      if (repoConfig['copilot-instructions-md'] !== undefined) {
-        repoCopilotInstructionsMd = repoConfig['copilot-instructions-md'];
-      }
+      const repoCopilotInstructionsMd =
+        repoConfig['copilot-instructions-md'] !== undefined
+          ? repoConfig['copilot-instructions-md']
+          : copilotInstructionsMd;
 
       // Handle repo-specific codeowners
-      let repoCodeowners = codeowners;
-      if (repoConfig['codeowners'] !== undefined) {
-        repoCodeowners = repoConfig['codeowners'];
-      }
-      let repoCodeownersTargetPath = codeownersTargetPath;
-      if (repoConfig['codeowners-target-path'] !== undefined) {
-        repoCodeownersTargetPath = repoConfig['codeowners-target-path'];
-      }
+      const repoCodeowners = repoConfig['codeowners'] !== undefined ? repoConfig['codeowners'] : codeowners;
+      const repoCodeownersTargetPath =
+        repoConfig['codeowners-target-path'] !== undefined
+          ? repoConfig['codeowners-target-path']
+          : codeownersTargetPath;
       // Handle repo-specific codeowners-vars (template variables)
-      let repoCodeownersVars = null;
-      if (repoConfig['codeowners-vars'] !== undefined) {
+      const repoCodeownersVars = (() => {
+        if (repoConfig['codeowners-vars'] === undefined) return null;
         if (
           repoConfig['codeowners-vars'] !== null &&
           typeof repoConfig['codeowners-vars'] === 'object' &&
           !Array.isArray(repoConfig['codeowners-vars'])
         ) {
-          repoCodeownersVars = repoConfig['codeowners-vars'];
-        } else {
-          core.warning(
-            `Invalid 'codeowners-vars' configuration for repo '${repoConfig.repo || repo}'; expected an object. This configuration will be ignored.`
-          );
+          return repoConfig['codeowners-vars'];
         }
-      }
+        core.warning(
+          `Invalid 'codeowners-vars' configuration for repo '${repo}'; expected an object. This configuration will be ignored.`
+        );
+        return null;
+      })();
 
       // Handle repo-specific security settings
       const repoSecuritySettings = {
-        secretScanning:
-          repoConfig['secret-scanning'] !== undefined ? repoConfig['secret-scanning'] : securitySettings.secretScanning,
-        secretScanningPushProtection:
-          repoConfig['secret-scanning-push-protection'] !== undefined
-            ? repoConfig['secret-scanning-push-protection']
-            : securitySettings.secretScanningPushProtection,
-        dependabotAlerts:
-          repoConfig['dependabot-alerts'] !== undefined
-            ? repoConfig['dependabot-alerts']
-            : securitySettings.dependabotAlerts,
-        dependabotSecurityUpdates:
-          repoConfig['dependabot-security-updates'] !== undefined
-            ? repoConfig['dependabot-security-updates']
-            : securitySettings.dependabotSecurityUpdates
+        secretScanning: coerceBooleanConfig(
+          repoConfig['secret-scanning'],
+          'secret-scanning',
+          repo,
+          securitySettings.secretScanning
+        ),
+        secretScanningPushProtection: coerceBooleanConfig(
+          repoConfig['secret-scanning-push-protection'],
+          'secret-scanning-push-protection',
+          repo,
+          securitySettings.secretScanningPushProtection
+        ),
+        privateVulnerabilityReporting: coerceBooleanConfig(
+          repoConfig['private-vulnerability-reporting'],
+          'private-vulnerability-reporting',
+          repo,
+          securitySettings.privateVulnerabilityReporting
+        ),
+        dependabotAlerts: coerceBooleanConfig(
+          repoConfig['dependabot-alerts'],
+          'dependabot-alerts',
+          repo,
+          securitySettings.dependabotAlerts
+        ),
+        dependabotSecurityUpdates: coerceBooleanConfig(
+          repoConfig['dependabot-security-updates'],
+          'dependabot-security-updates',
+          repo,
+          securitySettings.dependabotSecurityUpdates
+        )
       };
 
       const result = await updateRepositorySettings(
@@ -3540,10 +5114,27 @@ export async function run() {
       );
       results.push(result);
 
+      if (result.archived) {
+        successCount++;
+        core.info(`⏭️ Skipping archived repository ${repo}`);
+        continue;
+      }
+
+      // TODO(v3): Remove legacy sync warning properties (e.g., dependabotSyncWarning, gitignoreSyncWarning)
+      // and hasWarnings assignments below once consumers use subResults directly.
+      // See: https://github.com/joshjohanning/bulk-github-repo-settings-sync-action/pull/120
+
       // Sync dependabot.yml if specified
       if (repoDependabotYml) {
         core.info(`  📦 Checking dependabot.yml...`);
-        const dependabotResult = await syncDependabotYml(octokit, repo, repoDependabotYml, dependabotPrTitle, dryRun);
+        const dependabotResult = await syncDependabotYml(
+          octokit,
+          repo,
+          repoDependabotYml,
+          dependabotPrTitle,
+          dryRun,
+          authenticatedLogin
+        );
 
         // Add dependabot result to the main result
         result.dependabotSync = dependabotResult;
@@ -3553,15 +5144,50 @@ export async function run() {
           if (dependabotResult.prUrl) {
             core.info(`  🔗 PR URL: ${dependabotResult.prUrl}`);
           }
+          if (dependabotResult.dependabotYml && dependabotResult.dependabotYml !== 'unchanged') {
+            result.subResults.push(
+              createSubResult(
+                'dependabot-sync',
+                statusForSync(dependabotResult.dependabotYml),
+                dependabotResult.message,
+                {
+                  syncStatus: dependabotResult.dependabotYml,
+                  prNumber: dependabotResult.prNumber,
+                  prUrl: dependabotResult.prUrl
+                }
+              )
+            );
+          }
+          if (dependabotResult.stalePrWarning) {
+            result.hasWarnings = true;
+            result.subResults.push(
+              createSubResult('dependabot-sync', SubResultStatus.WARNING, dependabotResult.stalePrWarning.message, {
+                prNumber: dependabotResult.stalePrWarning.prNumber,
+                prUrl: dependabotResult.stalePrWarning.prUrl
+              })
+            );
+          }
         } else {
+          result.hasWarnings = true;
+          result.dependabotSyncWarning = dependabotResult.error;
           core.warning(`  ⚠️  ${dependabotResult.error}`);
+          result.subResults.push(
+            createSubResult('dependabot-sync', SubResultStatus.WARNING, 'Dependabot sync produced a warning')
+          );
         }
       }
 
       // Sync .gitignore if specified
       if (repoGitignore) {
         core.info(`  📝 Checking .gitignore...`);
-        const gitignoreResult = await syncGitignore(octokit, repo, repoGitignore, gitignorePrTitle, dryRun);
+        const gitignoreResult = await syncGitignore(
+          octokit,
+          repo,
+          repoGitignore,
+          gitignorePrTitle,
+          dryRun,
+          authenticatedLogin
+        );
 
         // Add gitignore result to the main result
         result.gitignoreSync = gitignoreResult;
@@ -3571,19 +5197,42 @@ export async function run() {
           if (gitignoreResult.prUrl) {
             core.info(`  🔗 PR URL: ${gitignoreResult.prUrl}`);
           }
+          if (gitignoreResult.gitignore && gitignoreResult.gitignore !== 'unchanged') {
+            result.subResults.push(
+              createSubResult('gitignore-sync', statusForSync(gitignoreResult.gitignore), gitignoreResult.message, {
+                syncStatus: gitignoreResult.gitignore,
+                prNumber: gitignoreResult.prNumber,
+                prUrl: gitignoreResult.prUrl
+              })
+            );
+          }
+          if (gitignoreResult.stalePrWarning) {
+            result.hasWarnings = true;
+            result.subResults.push(
+              createSubResult('gitignore-sync', SubResultStatus.WARNING, gitignoreResult.stalePrWarning.message, {
+                prNumber: gitignoreResult.stalePrWarning.prNumber,
+                prUrl: gitignoreResult.stalePrWarning.prUrl
+              })
+            );
+          }
         } else {
+          result.hasWarnings = true;
+          result.gitignoreSyncWarning = gitignoreResult.error;
           core.warning(`  ⚠️  ${gitignoreResult.error}`);
+          result.subResults.push(
+            createSubResult('gitignore-sync', SubResultStatus.WARNING, 'Gitignore sync produced a warning')
+          );
         }
       }
 
-      // Sync repository ruleset if specified
-      if (repoRulesetsFile) {
-        core.info(`  📋 Checking repository ruleset...`);
-        const rulesetResult = await syncRepositoryRuleset(
+      // Sync repository rulesets if specified
+      if (repoRulesetsFiles.length > 0) {
+        core.info(`  📋 Checking repository rulesets...`);
+        const rulesetResult = await syncRepositoryRulesets(
           octokit,
           repo,
-          repoRulesetsFile,
-          deleteUnmanagedRulesets,
+          repoRulesetsFiles,
+          repoDeleteUnmanagedRulesets,
           dryRun
         );
 
@@ -3592,8 +5241,17 @@ export async function run() {
 
         if (rulesetResult.success) {
           core.info(`  📋 ${rulesetResult.message}`);
+          // Propagate per-operation subResults from rulesets
+          if (rulesetResult.subResults) {
+            result.subResults.push(...rulesetResult.subResults);
+          }
         } else {
+          result.hasWarnings = true;
+          result.rulesetSyncWarning = rulesetResult.error;
           core.warning(`  ⚠️  ${rulesetResult.error}`);
+          result.subResults.push(
+            createSubResult('ruleset-sync', SubResultStatus.WARNING, 'Ruleset sync produced a warning')
+          );
         }
       }
 
@@ -3605,7 +5263,8 @@ export async function run() {
           repo,
           repoPullRequestTemplate,
           pullRequestTemplatePrTitle,
-          dryRun
+          dryRun,
+          authenticatedLogin
         );
 
         // Add pull request template result to the main result
@@ -3616,15 +5275,50 @@ export async function run() {
           if (templateResult.prUrl) {
             core.info(`  🔗 PR URL: ${templateResult.prUrl}`);
           }
+          if (templateResult.pullRequestTemplate && templateResult.pullRequestTemplate !== 'unchanged') {
+            result.subResults.push(
+              createSubResult(
+                'pr-template-sync',
+                statusForSync(templateResult.pullRequestTemplate),
+                templateResult.message,
+                {
+                  syncStatus: templateResult.pullRequestTemplate,
+                  prNumber: templateResult.prNumber,
+                  prUrl: templateResult.prUrl
+                }
+              )
+            );
+          }
+          if (templateResult.stalePrWarning) {
+            result.hasWarnings = true;
+            result.subResults.push(
+              createSubResult('pr-template-sync', SubResultStatus.WARNING, templateResult.stalePrWarning.message, {
+                prNumber: templateResult.stalePrWarning.prNumber,
+                prUrl: templateResult.stalePrWarning.prUrl
+              })
+            );
+          }
         } else {
+          result.hasWarnings = true;
+          result.pullRequestTemplateSyncWarning = templateResult.error;
           core.warning(`  ⚠️  ${templateResult.error}`);
+          result.subResults.push(
+            createSubResult('pr-template-sync', SubResultStatus.WARNING, 'PR template sync produced a warning')
+          );
         }
       }
 
       // Sync workflow files if specified
       if (repoWorkflowFiles && repoWorkflowFiles.length > 0) {
         core.info(`  🔧 Checking workflow files...`);
-        const workflowResult = await syncWorkflowFiles(octokit, repo, repoWorkflowFiles, workflowFilesPrTitle, dryRun);
+        const workflowResult = await syncWorkflowFiles(
+          octokit,
+          repo,
+          repoWorkflowFiles,
+          workflowFilesPrTitle,
+          dryRun,
+          authenticatedLogin
+        );
 
         // Add workflow files result to the main result
         result.workflowFilesSync = workflowResult;
@@ -3634,8 +5328,36 @@ export async function run() {
           if (workflowResult.prUrl) {
             core.info(`  🔗 PR URL: ${workflowResult.prUrl}`);
           }
+          if (workflowResult.workflowFiles && workflowResult.workflowFiles !== 'unchanged') {
+            result.subResults.push(
+              createSubResult(
+                'workflow-files-sync',
+                statusForSync(workflowResult.workflowFiles),
+                workflowResult.message,
+                {
+                  syncStatus: workflowResult.workflowFiles,
+                  prNumber: workflowResult.prNumber,
+                  prUrl: workflowResult.prUrl
+                }
+              )
+            );
+          }
+          if (workflowResult.stalePrWarning) {
+            result.hasWarnings = true;
+            result.subResults.push(
+              createSubResult('workflow-files-sync', SubResultStatus.WARNING, workflowResult.stalePrWarning.message, {
+                prNumber: workflowResult.stalePrWarning.prNumber,
+                prUrl: workflowResult.stalePrWarning.prUrl
+              })
+            );
+          }
         } else {
+          result.hasWarnings = true;
+          result.workflowFilesSyncWarning = workflowResult.error;
           core.warning(`  ⚠️  ${workflowResult.error}`);
+          result.subResults.push(
+            createSubResult('workflow-files-sync', SubResultStatus.WARNING, 'Workflow files sync produced a warning')
+          );
         }
       }
 
@@ -3649,8 +5371,71 @@ export async function run() {
 
         if (autolinksResult.success) {
           core.info(`  🔗 ${autolinksResult.message}`);
+          if (autolinksResult.autolinks && autolinksResult.autolinks !== 'unchanged') {
+            result.subResults.push(
+              createSubResult('autolinks-sync', SubResultStatus.CHANGED, autolinksResult.message, {
+                syncStatus: autolinksResult.autolinks
+              })
+            );
+          }
         } else {
+          result.hasWarnings = true;
+          result.autolinksSyncWarning = autolinksResult.error;
           core.warning(`  ⚠️  ${autolinksResult.error}`);
+          result.subResults.push(
+            createSubResult('autolinks-sync', SubResultStatus.WARNING, 'Autolinks sync produced a warning')
+          );
+        }
+      }
+
+      // Sync environments if specified (delete-unmanaged requires explicit env config to prevent accidental mass deletion)
+      if (
+        repoEnvironments &&
+        (repoEnvironments.length > 0 || (repoDeleteUnmanagedEnvironments && repoHasExplicitEnvConfig))
+      ) {
+        core.info(`  🌍 Checking environments...`);
+        const environmentsResult = await syncEnvironments(
+          octokit,
+          repo,
+          repoEnvironments,
+          repoDeleteUnmanagedEnvironments,
+          dryRun,
+          reviewerCache
+        );
+
+        // Add environments result to the main result
+        result.environmentsSync = environmentsResult;
+
+        if (environmentsResult.success) {
+          core.info(`  🌍 ${environmentsResult.message}`);
+          if (environmentsResult.environments && environmentsResult.environments !== 'unchanged') {
+            result.subResults.push(
+              createSubResult('environments-sync', SubResultStatus.CHANGED, environmentsResult.message, {
+                syncStatus: environmentsResult.environments
+              })
+            );
+          }
+          // Propagate protection rule and branch policy subResults
+          if (environmentsResult.protectionRuleSubResults) {
+            result.subResults.push(...environmentsResult.protectionRuleSubResults);
+          }
+          if (environmentsResult.branchPolicySubResults) {
+            result.subResults.push(...environmentsResult.branchPolicySubResults);
+          }
+          // Mark warnings from protection rules and branch policies
+          if (
+            environmentsResult.protectionRuleSubResults?.some(s => s.status === SubResultStatus.WARNING) ||
+            environmentsResult.branchPolicySubResults?.some(s => s.status === SubResultStatus.WARNING)
+          ) {
+            result.hasWarnings = true;
+          }
+        } else {
+          result.hasWarnings = true;
+          result.environmentsSyncWarning = environmentsResult.error;
+          core.warning(`  ⚠️  ${environmentsResult.error}`);
+          result.subResults.push(
+            createSubResult('environments-sync', SubResultStatus.WARNING, 'Environments sync produced a warning')
+          );
         }
       }
 
@@ -3662,7 +5447,8 @@ export async function run() {
           repo,
           repoCopilotInstructionsMd,
           copilotInstructionsPrTitle,
-          dryRun
+          dryRun,
+          authenticatedLogin
         );
 
         // Add copilot instructions result to the main result
@@ -3673,8 +5459,45 @@ export async function run() {
           if (copilotResult.prUrl) {
             core.info(`  🔗 PR URL: ${copilotResult.prUrl}`);
           }
+          if (copilotResult.copilotInstructions && copilotResult.copilotInstructions !== 'unchanged') {
+            result.subResults.push(
+              createSubResult(
+                'copilot-instructions-sync',
+                statusForSync(copilotResult.copilotInstructions),
+                copilotResult.message,
+                {
+                  syncStatus: copilotResult.copilotInstructions,
+                  prNumber: copilotResult.prNumber,
+                  prUrl: copilotResult.prUrl
+                }
+              )
+            );
+          }
+          if (copilotResult.stalePrWarning) {
+            result.hasWarnings = true;
+            result.subResults.push(
+              createSubResult(
+                'copilot-instructions-sync',
+                SubResultStatus.WARNING,
+                copilotResult.stalePrWarning.message,
+                {
+                  prNumber: copilotResult.stalePrWarning.prNumber,
+                  prUrl: copilotResult.stalePrWarning.prUrl
+                }
+              )
+            );
+          }
         } else {
+          result.hasWarnings = true;
+          result.copilotInstructionsSyncWarning = copilotResult.error;
           core.warning(`  ⚠️  ${copilotResult.error}`);
+          result.subResults.push(
+            createSubResult(
+              'copilot-instructions-sync',
+              SubResultStatus.WARNING,
+              'Copilot instructions sync produced a warning'
+            )
+          );
         }
       }
 
@@ -3692,6 +5515,7 @@ export async function run() {
           repoCodeownersTargetPath,
           codeownersPrTitle,
           dryRun,
+          authenticatedLogin,
           repoCodeownersVars
         );
 
@@ -3703,8 +5527,31 @@ export async function run() {
           if (codeownersResult.prUrl) {
             core.info(`  🔗 PR URL: ${codeownersResult.prUrl}`);
           }
+          if (codeownersResult.codeowners && codeownersResult.codeowners !== 'unchanged') {
+            result.subResults.push(
+              createSubResult('codeowners-sync', statusForSync(codeownersResult.codeowners), codeownersResult.message, {
+                syncStatus: codeownersResult.codeowners,
+                prNumber: codeownersResult.prNumber,
+                prUrl: codeownersResult.prUrl
+              })
+            );
+          }
+          if (codeownersResult.stalePrWarning) {
+            result.hasWarnings = true;
+            result.subResults.push(
+              createSubResult('codeowners-sync', SubResultStatus.WARNING, codeownersResult.stalePrWarning.message, {
+                prNumber: codeownersResult.stalePrWarning.prNumber,
+                prUrl: codeownersResult.stalePrWarning.prUrl
+              })
+            );
+          }
         } else {
+          result.hasWarnings = true;
+          result.codeownersSyncWarning = codeownersResult.error;
           core.warning(`  ⚠️  ${codeownersResult.error}`);
+          result.subResults.push(
+            createSubResult('codeowners-sync', SubResultStatus.WARNING, 'CODEOWNERS sync produced a warning')
+          );
         }
       }
 
@@ -3724,7 +5571,8 @@ export async function run() {
           repoSyncScripts,
           repoSyncEngines,
           packageJsonPrTitle,
-          dryRun
+          dryRun,
+          authenticatedLogin
         );
 
         // Add package.json result to the main result
@@ -3740,26 +5588,68 @@ export async function run() {
               core.info(`     - ${dryRun ? 'Would update' : 'Updated'} ${change.field}`);
             }
           }
+          if (packageJsonResult.packageJson && packageJsonResult.packageJson !== 'unchanged') {
+            result.subResults.push(
+              createSubResult(
+                'package-json-sync',
+                statusForSync(packageJsonResult.packageJson),
+                packageJsonResult.message,
+                {
+                  syncStatus: packageJsonResult.packageJson,
+                  prNumber: packageJsonResult.prNumber,
+                  prUrl: packageJsonResult.prUrl
+                }
+              )
+            );
+          }
+          if (packageJsonResult.stalePrWarning) {
+            result.hasWarnings = true;
+            result.subResults.push(
+              createSubResult('package-json-sync', SubResultStatus.WARNING, packageJsonResult.stalePrWarning.message, {
+                prNumber: packageJsonResult.stalePrWarning.prNumber,
+                prUrl: packageJsonResult.stalePrWarning.prUrl
+              })
+            );
+          }
         } else {
+          result.hasWarnings = true;
+          result.packageJsonSyncWarning = packageJsonResult.error;
           core.warning(`  ⚠️  ${packageJsonResult.error}`);
+          result.subResults.push(
+            createSubResult('package-json-sync', SubResultStatus.WARNING, 'Package.json sync produced a warning')
+          );
         }
       }
 
+      // Derive hasWarnings from subResults
+      // TODO(v3): Remove hasWarnings once consumers use subResults directly
+      result.hasWarnings = result.subResults.some(s => s.status === SubResultStatus.WARNING);
+
       if (result.success) {
         successCount++;
+        if (result.hasWarnings) {
+          warningCount++;
+        }
         const repoHasChanges = hasRepositoryChanges(result);
+        const repoHasPending = !repoHasChanges && hasRepositoryPending(result);
         if (repoHasChanges) {
           changedCount++;
+        } else if (repoHasPending) {
+          pendingCount++;
         }
         if (dryRun) {
           if (repoHasChanges) {
             core.info(`🔍 Would update ${repo}`);
+          } else if (repoHasPending) {
+            core.info(`🔄 Pending sync PR(s) for ${repo}`);
           } else {
             core.info(`✅ No changes needed in ${repo}`);
           }
         } else {
           if (repoHasChanges) {
             core.info(`✅ Successfully updated ${repo}`);
+          } else if (repoHasPending) {
+            core.info(`🔄 Pending sync PR(s) for ${repo}`);
           } else {
             core.info(`✅ No changes needed in ${repo}`);
           }
@@ -3802,17 +5692,18 @@ export async function run() {
 
         // Log code scanning changes
         if (result.codeScanningChange) {
+          const enabling = result.codeScanningChange.to === 'configured';
           if (dryRun) {
             core.info(
-              `  📊 Would enable CodeQL scanning: ${result.codeScanningChange.from} → ${result.codeScanningChange.to}`
+              `  📊 Would ${enabling ? 'enable' : 'disable'} CodeQL scanning: ${result.codeScanningChange.from} → ${result.codeScanningChange.to}`
             );
           } else {
             core.info(
-              `  📊 CodeQL scanning enabled: ${result.codeScanningChange.from} → ${result.codeScanningChange.to}`
+              `  📊 CodeQL scanning ${enabling ? 'enabled' : 'disabled'}: ${result.codeScanningChange.from} → ${result.codeScanningChange.to}`
             );
           }
         } else if (result.codeScanningUnchanged) {
-          core.info(`  📊 CodeQL scanning unchanged: already configured`);
+          core.info(`  📊 CodeQL scanning unchanged: ${result.currentCodeScanning}`);
         }
 
         if (result.codeScanningWarning) {
@@ -3924,95 +5815,126 @@ export async function run() {
     }
 
     // Set outputs
-    const unchangedCount = successCount - changedCount;
+    const unchangedCount = successCount - changedCount - pendingCount;
     core.setOutput('updated-repositories', successCount.toString());
     core.setOutput('changed-repositories', changedCount.toString());
+    core.setOutput('pending-repositories', pendingCount.toString());
     core.setOutput('unchanged-repositories', unchangedCount.toString());
     core.setOutput('failed-repositories', failureCount.toString());
+    core.setOutput('warning-repositories', warningCount.toString());
     core.setOutput('results', JSON.stringify(results));
 
     // Create summary
-    const summaryTable = [
-      [
-        { data: 'Repository', header: true },
-        { data: 'Status', header: true },
-        { data: 'Details', header: true }
-      ],
-      ...results.map(r => {
-        if (!r.success) {
-          return [r.repository, '❌ Failed', r.error];
-        }
-
-        // Determine what actually happened
-        const hasChanges = hasRepositoryChanges(r);
-
-        let details;
-        if (hasChanges) {
-          // Get specific list of changes
-          const changesList = getChangesList(r, dryRun);
-          if (changesList.length > 0) {
-            // Format as bullet points for readability
-            details = changesList.join('; ');
-          } else {
-            details = dryRun ? 'Would update' : 'Updated';
+    if (writeJobSummary) {
+      const summaryTable = [
+        [
+          { data: 'Repository', header: true },
+          { data: 'Status', header: true },
+          { data: 'Details', header: true }
+        ],
+        ...results.map(r => {
+          if (!r.success) {
+            return [r.repository, '❌ Failed', r.error];
           }
-        } else {
-          details = 'No changes needed';
+
+          const hasChanges = hasRepositoryChanges(r);
+          const isPending = !hasChanges && hasRepositoryPending(r);
+          let status;
+          let details;
+
+          if (r.archived) {
+            status = '⏭️ Skipped';
+          } else if (r.hasWarnings) {
+            status = '⚠️ Warning';
+          } else if (hasChanges) {
+            status = '✅ Changed';
+          } else if (isPending) {
+            status = '🔄 Pending';
+          } else {
+            status = '➖ No changes';
+          }
+
+          if (r.archived) {
+            details = 'Repository is archived';
+          } else if (r.subResults && r.subResults.length > 0) {
+            const messages = r.subResults
+              .filter(
+                s =>
+                  s.status === SubResultStatus.WARNING ||
+                  s.status === SubResultStatus.CHANGED ||
+                  s.status === SubResultStatus.PENDING
+              )
+              .map(s => formatSubResultSummary(s, dryRun));
+            details = messages.length > 0 ? messages.join('; ') : 'No changes needed';
+          } else {
+            details = 'No changes needed';
+          }
+
+          return [r.repository, status, details];
+        })
+      ];
+
+      try {
+        const heading = dryRun ? `${jobSummaryHeadingBase} (DRY-RUN)` : jobSummaryHeadingBase;
+
+        let summaryBuilder = core.summary.addHeading(heading);
+
+        if (dryRun) {
+          summaryBuilder = summaryBuilder.addRaw('\n**🔍 DRY-RUN MODE:** No changes were applied\n');
         }
 
-        return [r.repository, hasChanges ? '✅ Changed' : '➖ No changes', details];
-      })
-    ];
-
-    try {
-      const heading = dryRun
-        ? 'Bulk Repository Settings Update Results (DRY-RUN)'
-        : 'Bulk Repository Settings Update Results';
-
-      let summaryBuilder = core.summary.addHeading(heading);
-
-      if (dryRun) {
-        summaryBuilder = summaryBuilder.addRaw('\n**🔍 DRY-RUN MODE:** No changes were applied\n');
-      }
-
-      summaryBuilder
-        .addRaw(`\n**Total Repositories:** ${repoList.length}`)
-        .addRaw(`\n**Changed:** ${changedCount}`)
-        .addRaw(`\n**Unchanged:** ${unchangedCount}`)
-        .addRaw(`\n**Failed:** ${failureCount}\n\n`)
-        .addTable(summaryTable)
-        .write();
-    } catch {
-      // Fallback for local development
-      const heading = dryRun
-        ? '🔍 DRY-RUN: Bulk Repository Settings Update Results'
-        : '📊 Bulk Repository Settings Update Results';
-      core.info(heading);
-      core.info(`Total Repositories: ${repoList.length}`);
-      core.info(`Changed: ${changedCount}`);
-      core.info(`Unchanged: ${unchangedCount}`);
-      core.info(`Failed: ${failureCount}`);
-      for (const result of results) {
-        if (!result.success) {
-          core.info(`  ${result.repository}: ❌ ${result.error}`);
-        } else {
-          const hasChanges = hasRepositoryChanges(result);
-          const details = dryRun
-            ? hasChanges
-              ? 'Would update'
-              : 'No changes needed'
-            : hasChanges
-              ? 'Updated'
-              : 'No changes needed';
-          core.info(`  ${result.repository}: ${hasChanges ? '✅' : '➖'} ${details}`);
+        summaryBuilder
+          .addRaw(`\n**Total Repositories:** ${repoList.length}`)
+          .addRaw(`\n**Changed:** ${changedCount}`)
+          .addRaw(`\n**Pending:** ${pendingCount}`)
+          .addRaw(`\n**Unchanged:** ${unchangedCount}`)
+          .addRaw(`\n**Warnings:** ${warningCount}`)
+          .addRaw(`\n**Failed:** ${failureCount}\n\n`)
+          .addTable(summaryTable);
+        await summaryBuilder.write();
+      } catch {
+        // Fallback for local development
+        const heading = dryRun ? `🔍 DRY-RUN: ${jobSummaryHeadingBase}` : `📊 ${jobSummaryHeadingBase}`;
+        core.info(heading);
+        core.info(`Total Repositories: ${repoList.length}`);
+        core.info(`Changed: ${changedCount}`);
+        core.info(`Pending: ${pendingCount}`);
+        core.info(`Unchanged: ${unchangedCount}`);
+        core.info(`Warnings: ${warningCount}`);
+        core.info(`Failed: ${failureCount}`);
+        for (const result of results) {
+          if (!result.success) {
+            core.info(`  ${result.repository}: ❌ ${result.error}`);
+          } else if (result.hasWarnings) {
+            core.info(`  ${result.repository}: ⚠️ Warning`);
+          } else {
+            const hasChanges = hasRepositoryChanges(result);
+            const isPending = !hasChanges && hasRepositoryPending(result);
+            let icon;
+            let details;
+            if (hasChanges) {
+              icon = '✅';
+              details = dryRun ? 'Would update' : 'Updated';
+            } else if (isPending) {
+              icon = '🔄';
+              details = 'Pending sync PR(s)';
+            } else {
+              icon = '➖';
+              details = 'No changes needed';
+            }
+            core.info(`  ${result.repository}: ${icon} ${details}`);
+          }
         }
       }
+    } else {
+      core.info('Job summary writing is disabled (write-job-summary: false)');
     }
 
-    core.info('✅ Action completed successfully!');
-
     if (failureCount > 0) {
-      core.warning(`${failureCount} repositories failed to update`);
+      const repositoryLabel = failureCount === 1 ? 'repository' : 'repositories';
+      core.setFailed(`${failureCount} ${repositoryLabel} failed to update`);
+    } else {
+      core.info('✅ Action completed successfully!');
     }
   } catch (error) {
     core.setFailed(`Action failed with error: ${error.message}`);

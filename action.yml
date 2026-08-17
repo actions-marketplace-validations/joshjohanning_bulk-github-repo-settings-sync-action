@@ -36,8 +36,20 @@ inputs:
   allow-squash-merge:
     description: 'Allow squash merging pull requests'
     required: false
+  squash-merge-commit-title:
+    description: 'Default title for squash merge commits. Allowed values: PR_TITLE, COMMIT_OR_PR_TITLE'
+    required: false
+  squash-merge-commit-message:
+    description: 'Default message for squash merge commits. Allowed values: PR_BODY, COMMIT_MESSAGES, BLANK'
+    required: false
   allow-merge-commit:
     description: 'Allow merge commits for pull requests'
+    required: false
+  merge-commit-title:
+    description: 'Default title for merge commits. Allowed values: PR_TITLE, MERGE_MESSAGE'
+    required: false
+  merge-commit-message:
+    description: 'Default message for merge commits. Allowed values: PR_TITLE, PR_BODY, BLANK'
     required: false
   allow-rebase-merge:
     description: 'Allow rebase merging pull requests'
@@ -69,6 +81,9 @@ inputs:
   secret-scanning-push-protection:
     description: 'Enable or disable secret scanning push protection for repositories'
     required: false
+  private-vulnerability-reporting:
+    description: 'Enable or disable private vulnerability reporting for repositories'
+    required: false
   dependabot-alerts:
     description: 'Enable or disable Dependabot alerts (vulnerability alerts) for repositories. Also enables the dependency graph.'
     required: false
@@ -97,10 +112,10 @@ inputs:
     required: false
     default: 'chore: update .gitignore'
   rulesets-file:
-    description: 'Path to a JSON file containing repository ruleset configuration to sync to target repositories'
+    description: 'Comma-separated paths to JSON files, each containing a repository ruleset configuration to sync to target repositories'
     required: false
   delete-unmanaged-rulesets:
-    description: 'Delete all other rulesets besides the one being synced'
+    description: 'Delete all other rulesets besides those being synced'
     required: false
     default: 'false'
   pull-request-template:
@@ -120,6 +135,16 @@ inputs:
   autolinks-file:
     description: 'Path to a JSON file containing autolink references to sync to target repositories'
     required: false
+  environments:
+    description: 'Comma-separated list of environment names to sync (creates new environments only; existing environments are not updated)'
+    required: false
+  environments-file:
+    description: 'Path to a YAML or JSON file with detailed environment configurations (reviewers, wait timers, branch policies, deployment protection rules, branch name patterns)'
+    required: false
+  delete-unmanaged-environments:
+    description: 'Delete environments not defined in the environments configuration'
+    required: false
+    default: 'false'
   copilot-instructions-md:
     description: 'Path to a copilot-instructions.md file to sync to .github/copilot-instructions.md in target repositories'
     required: false
@@ -159,19 +184,31 @@ inputs:
     description: 'Preview changes without applying them (logs what would be changed)'
     required: false
     default: 'false'
+  write-job-summary:
+    description: 'Write a summary table to the GitHub Actions job summary'
+    required: false
+    default: 'true'
+  summary-heading:
+    description: 'Custom heading for the GitHub Actions job summary'
+    required: false
+    default: 'Bulk Repository Settings Update Results'
 
 outputs:
   updated-repositories:
-    description: 'Number of repositories successfully processed (changed + unchanged)'
+    description: 'Number of repositories successfully processed (changed + pending + unchanged)'
   changed-repositories:
-    description: 'Number of repositories that had changes (or would have changes in dry-run mode)'
+    description: 'Number of repositories with reportable changes made this run (or would have in dry-run mode). Repos with only pending sync PRs are counted under pending-repositories instead.'
+  pending-repositories:
+    description: 'Number of repositories with an open sync PR that is already up-to-date and just needs merging (no action was taken this run)'
   unchanged-repositories:
-    description: 'Number of repositories that required no changes'
+    description: 'Number of repositories with no reportable changes (may include warnings)'
   failed-repositories:
     description: 'Number of repositories that failed to update'
+  warning-repositories:
+    description: 'Number of repositories that emitted warnings'
   results:
     description: 'JSON array of update results for each repository'
 
 runs:
-  using: 'node20'
+  using: 'node24'
   main: 'dist/index.js'
